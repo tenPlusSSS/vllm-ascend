@@ -103,6 +103,7 @@ class NPUModelRunner(GPUModelRunner):
     supports_standardized_shared_kv_backing = True
 
     execute_model_state: ExecuteModelState | None
+    _pcp_seq_lens_batch: BatchReqState | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -306,6 +307,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
+                self.pcp_manager.decode_balance_policy = self.ascend_config.pcp_decode_balance_policy
                 self.pcp_manager.kv_cache_config = kv_cache_config
                 self.pcp_manager.global_input_buffers = self.input_buffers
                 self.model_state.pcp_manager = self.pcp_manager
@@ -365,15 +367,16 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        output = super().execute_model(
-            scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-            is_profile=is_profile,
-            context_len=context_len,
-            valid_dummy_state_slots=valid_dummy_state_slots,
-        )
+        with self._pcp_decode_plan_scope():
+            output = super().execute_model(
+                scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                is_profile=is_profile,
+                context_len=context_len,
+                valid_dummy_state_slots=valid_dummy_state_slots,
+            )
         self.model_state.kvpp_is_dummy_run = False
         self.kvpp.complete_forward()
 
@@ -403,7 +406,24 @@ class NPUModelRunner(GPUModelRunner):
                     self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
             super().profile_run()
 
+    @contextmanager
+    def _pcp_decode_plan_scope(self):
+        """Also clear plans on dispatch failures and zero-token/dummy steps."""
+        self._pcp_seq_lens_batch = None
+        manager = self.pcp_manager
+        if manager is not None:
+            manager.clear_decode_partition_plan()
+        try:
+            yield
+        finally:
+            self._pcp_seq_lens_batch = None
+            if manager is not None:
+                manager.clear_decode_partition_plan()
+
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
+        self._pcp_seq_lens_batch = None
+        if self.pcp_manager is not None:
+            self.pcp_manager.clear_decode_partition_plan()
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
         if batch_state is not None and is_pd_decode_recompute_scheduler_enabled(self.vllm_config):
             pd_decode_recompute = (
@@ -424,6 +444,25 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.has_prefill,
                 )
+        if (
+            batch_state is not None
+            and not dummy_run
+            and self.pcp_manager is not None
+            and self.pcp_manager.decode_balance_enabled
+            # Adaptive verification compacts query layouts later in prepare_inputs.
+            # Keep round-robin until it can supply a final pre-dispatch snapshot.
+            and not (self.adaptive_verification is not None and scheduler_output.scheduled_spec_decode_tokens)
+        ):
+            # Move the existing rejection correction before owner planning. Do
+            # not wait/correct again when preparing this same batch's tensors.
+            self._update_seq_lens_cpu(scheduler_output, batch_state.req_ids)
+            self.pcp_manager.prepare_decode_partition(
+                batch_state.req_ids,
+                batch_state.num_scheduled_tokens,
+                batch_state.is_prefilling_np,
+                self.req_states.num_computed_tokens_np[batch_state.idx_mapping_np],
+            )
+            self._pcp_seq_lens_batch = batch_state
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -460,7 +499,8 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = batch_req_state.req_ids
 
-        self._update_seq_lens_cpu(scheduler_output, req_ids)
+        if self._pcp_seq_lens_batch is not batch_req_state:
+            self._update_seq_lens_cpu(scheduler_output, req_ids)
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np

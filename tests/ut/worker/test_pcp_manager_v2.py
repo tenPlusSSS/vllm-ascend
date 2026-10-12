@@ -81,6 +81,12 @@ def _make_pcp_config(
     )
 
 
+def _prepare_decode_plan(manager, batch):
+    manager.prepare_decode_partition(
+        batch.req_ids, batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+    )
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_decode_sharding_uses_parallel_config(enabled):
     manager = AscendPCPManager(2, 1, torch.device("cpu"), dcp_world_size=1)
@@ -1171,3 +1177,378 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
             expected.append((3, rank, 1))
         assert chunks == expected
     assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 5
+
+
+@pytest.mark.parametrize(
+    "world_size,counts,computed,prefilling,expected",
+    [
+        (2, [1, 1, 1, 1], [0, 9999, 0, 9999], [False] * 4, [0, 0, 1, 1]),
+        (2, [1, 1, 1, 1], [10] * 4, [False] * 4, [0, 1, 0, 1]),
+        # Greedy reaches 17/14, worse than round-robin's 16/15.
+        (2, [1] * 6, [7, 5, 6, 4, 0, 3], [False] * 6, [0, 1, 0, 1, 0, 1]),
+        (2, [4] * 4, [0, 10**9, 0, 10**9], [False] * 4, [0, 0, 1, 1]),
+        # Equal attention work alone cannot improve RR's 16/2 query tokens.
+        (2, [8, 1, 8, 1], [100, 835, 100, 835], [False] * 4, [0, 0, 1, 1]),
+        # Normalized integer scores exceed int64 for this long-query case.
+        (2, [65536] * 4, [0, 10**9, 0, 10**9], [False] * 4, [0, 0, 1, 1]),
+        # Greedy reaches 13/13 tokens, leaving no room for q=4 under cap=16.
+        (2, [8, 6, 7, 5, 1, 4], [100] * 6, [False] * 6, [0, 1, 0, 1, 0, 1]),
+        (2, [1, 1, 2, 2], [0, 100, 0, 100], [False] * 4, [0, 1, 1, 0]),
+        # Prefill cannot improve the decode-only score by swapping two decodes.
+        (2, [5, 1, 1], [0, 0, 10], [True, False, False], [-1, 0, 1]),
+        # Equal prefill chunks must not dilute either decode normalization term.
+        (2, [8, 8, 4, 6, 8], [176, 65, 232, 34, 0], [False] * 4 + [True], [0, 1, 1, 0, -1]),
+        (2, [8, 8, 4, 6, 8], [176, 65, 232, 34, 10**6], [False] * 4 + [True], [0, 1, 1, 0, -1]),
+        # Ignoring prefill's 2/3 tokens would allow 4/6 total tokens under cap=5.
+        (2, [5, 2, 1, 1, 1], [0, 99, 999, 9, 0], [True] + [False] * 4, [-1, 0, 1, 0, 1]),
+        (8, [0, 1, 0, 1], [100, 1, 100, 100], [False] * 4, [-1, 0, -1, 1]),
+        (2, [0, 5], [0, 10], [False, True], [-1, -1]),
+        (1, [1, 1], [1, 100], [False, False], [0, 0]),
+        (2, [], [], [], []),
+    ],
+)
+def test_decode_owners_balance_queries_and_attention_within_capacity(
+    world_size, counts, computed, prefilling, expected
+):
+    manager = AscendPCPManager(world_size, 0, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
+    batch = SimpleNamespace(
+        num_scheduled_tokens=np.array(counts, dtype=np.int32),
+        num_computed_tokens_np=np.array(computed, dtype=np.int32),
+        is_prefilling_np=np.array(prefilling, dtype=np.bool_),
+    )
+    original_arrays = [value.copy() for value in vars(batch).values()]
+    dispatch_capacity = manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np)
+    owners = manager._balance_decode_owners(
+        batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+    )
+    np.testing.assert_array_equal(owners, expected)
+    for rank in range(world_size):
+        manager.pcp_rank = rank
+        np.testing.assert_array_equal(
+            manager._balance_decode_owners(
+                batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+            ),
+            owners,
+        )
+        before = list(manager._iter_rank_chunks(rank, batch.num_scheduled_tokens, batch.is_prefilling_np))
+        manager._decode_owner_ranks = owners
+        try:
+            after = list(manager._iter_rank_chunks(rank, batch.num_scheduled_tokens, batch.is_prefilling_np))
+        finally:
+            manager._decode_owner_ranks = None
+        assert [chunk for chunk in after if prefilling[chunk[0]]] == [chunk for chunk in before if prefilling[chunk[0]]]
+        # Query lengths can move between ranks, but request counts and the
+        # dispatch token upper bound remain safe, including mixed batches.
+        assert len(after) == len(before)
+        assert sum(chunk[2] for chunk in after) <= dispatch_capacity
+        if len(set(counts)) <= 1:
+            assert sum(chunk[2] for chunk in after) == sum(chunk[2] for chunk in before)
+        assert [chunk[0] for chunk in after if not prefilling[chunk[0]]] == np.flatnonzero(owners == rank).tolist()
+    for actual, original in zip(vars(batch).values(), original_arrays, strict=True):
+        np.testing.assert_array_equal(actual, original)
+
+
+@pytest.mark.parametrize("padded_num_tokens", [None, 9, 12, 16])
+def test_query_balancing_preserves_speculative_inputs_and_dispatch_capacity(padded_num_tokens):
+    counts = np.array([8, 1, 8, 1], dtype=np.int32)
+    computed = np.array([100, 835, 100, 835], dtype=np.int32)
+    buffers = AscendInputBuffers(4, 18, torch.device("cpu"))
+    base = InputBatch.make_dummy(4, 18, buffers, max_query_len=8)
+    batch = AscendInputBatch(**base.__dict__, seq_lens_np=computed + counts)
+    batch.is_dummy = False
+    batch.req_ids = [f"spec-{idx}" for idx in range(4)]
+    batch.idx_mapping_np = np.arange(4, dtype=np.int32)
+    batch.idx_mapping.copy_(torch.arange(4, dtype=torch.int32))
+    batch.num_scheduled_tokens = counts
+    batch.num_computed_tokens_np = computed
+    batch.prefill_len_np = computed.copy()
+    batch.num_computed_prefill_tokens_np = computed.copy()
+    batch.is_prefilling_np = np.zeros(4, dtype=np.bool_)
+    batch.has_prefill = False
+    batch.num_draft_tokens_per_req = counts - 1
+    batch.num_draft_tokens = 14
+    batch.input_ids.copy_(torch.arange(18, dtype=torch.int32))
+    batch.positions.copy_(torch.cat([torch.arange(int(c), int(c + q)) for c, q in zip(computed, counts)]))
+    batch.query_start_loc_np = np.concatenate(([0], counts.cumsum())).astype(np.int32)
+    batch.query_start_loc.copy_(torch.from_numpy(batch.query_start_loc_np))
+    batch.seq_lens.copy_(torch.from_numpy(computed + counts))
+    batch.seq_lens_cpu_upper_bound = torch.from_numpy(computed + counts)
+    managers = [AscendPCPManager(2, rank, torch.device("cpu"), max_num_reqs=4, max_num_tokens=18) for rank in range(2)]
+    local_ids = []
+    for rank, manager in enumerate(managers):
+        manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
+        manager.vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=7)
+        manager.decode_balance_policy = "load_balance"
+        assert manager.get_num_tokens_for_dispatch(counts, batch.is_prefilling_np) == 16
+        _prepare_decode_plan(manager, batch)
+        assert manager.get_num_tokens_for_dispatch(counts, batch.is_prefilling_np) == 9
+        with patch("vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d", side_effect=_mock_async_copy_to_cpu):
+            local = manager.partition_batch(batch, padded_num_tokens=padded_num_tokens)
+        assert local.num_reqs == 2
+        assert local.num_tokens == 9
+        assert local.num_tokens_after_padding == (padded_num_tokens or 9)
+        assert local.req_ids == batch.req_ids[2 * rank : 2 * rank + 2]
+        assert local.num_scheduled_tokens.tolist() == [8, 1]
+        assert local.num_draft_tokens_per_req.tolist() == [7, 0]
+        assert local.num_draft_tokens == 7
+        torch.testing.assert_close(local.input_ids[:9], batch.input_ids[9 * rank : 9 * (rank + 1)])
+        torch.testing.assert_close(local.positions[:9], batch.positions[9 * rank : 9 * (rank + 1)])
+        assert manager._decode_owner_ranks is None
+        assert manager._decode_partition_plan is None
+        local_ids.append(local.input_ids.clone())
+    gathered = torch.cat(local_ids)
+    for manager in managers:
+        torch.testing.assert_close(gathered[manager._hidden_restore_idx], batch.input_ids)
+        valid_indices = manager._padded_gather_idx[manager._gathered_kv_write_mask]
+        assert sorted(valid_indices.tolist()) == list(range(18))
+    assert batch.num_draft_tokens == 14
+    assert batch.num_draft_tokens_per_req.tolist() == [7, 0, 7, 0]
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("policy", [None, "round_robin", "load_balance"])
+def test_partition_failure_clears_decode_owners(sharded, policy):
+    manager = AscendPCPManager(2, 0, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE, pcp_shard_decode_requests=sharded)
+    if policy is not None:
+        manager.decode_balance_policy = policy
+    else:
+        assert manager.decode_balance_policy == "round_robin"
+    balance_enabled = sharded and policy == "load_balance"
+    batch = SimpleNamespace(
+        req_ids=[f"req-{idx}" for idx in range(4)],
+        num_scheduled_tokens=np.ones(4, dtype=np.int32),
+        num_computed_tokens_np=np.array([0, 9999, 0, 9999], dtype=np.int32),
+        is_prefilling_np=np.zeros(4, dtype=np.bool_),
+    )
+
+    def fail_partition(*args, **kwargs):
+        chunks = list(manager._iter_rank_chunks(0, batch.num_scheduled_tokens, batch.is_prefilling_np))
+        expected = [0, 1] if balance_enabled else [0, 2]
+        assert [chunk[0] for chunk in chunks] == (expected if sharded else [0, 1, 2, 3])
+        raise RuntimeError("partition failed")
+
+    with (
+        patch.object(PCPManager, "partition_batch", side_effect=fail_partition),
+        patch.object(manager, "_balance_decode_owners", wraps=manager._balance_decode_owners) as balance,
+        pytest.raises(RuntimeError, match="partition failed"),
+    ):
+        _prepare_decode_plan(manager, batch)
+        manager.partition_batch(batch)
+    assert manager._decode_owner_ranks is None
+    assert manager._decode_partition_plan is None
+    assert balance.call_count == int(balance_enabled)
+    chunks = list(manager._iter_rank_chunks(0, batch.num_scheduled_tokens, batch.is_prefilling_np))
+    assert [chunk[0] for chunk in chunks] == ([0, 2] if sharded else [0, 1, 2, 3])
+
+
+@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY])
+@pytest.mark.parametrize("policy", [None, "round_robin", "load_balance"])
+def test_balanced_partition_restores_global_order_across_steps(graph_mode, policy):
+    buffers = AscendInputBuffers(4, 4, torch.device("cpu"))
+    base = InputBatch.make_dummy(4, 4, buffers, max_query_len=1)
+    batch = AscendInputBatch(**base.__dict__, seq_lens_np=np.ones(4, dtype=np.int32))
+    batch.is_dummy = False
+    batch.req_ids = [f"decode-{idx}" for idx in range(4)]
+    batch.num_scheduled_tokens = np.ones(4, dtype=np.int32)
+    batch.num_computed_tokens_np = np.zeros(4, dtype=np.int32)
+    batch.prefill_len_np = np.zeros(4, dtype=np.int32)
+    batch.num_computed_prefill_tokens_np = np.zeros(4, dtype=np.int32)
+    batch.is_prefilling_np = np.zeros(4, dtype=np.bool_)
+    batch.has_prefill = False
+    batch.num_draft_tokens = 0
+    batch.input_ids.copy_(torch.arange(4, dtype=torch.int32))
+    batch.query_start_loc_np = np.arange(5, dtype=np.int32)
+    batch.query_start_loc.copy_(torch.arange(5, dtype=torch.int32))
+    managers = [AscendPCPManager(2, rank, torch.device("cpu"), max_num_reqs=4, max_num_tokens=4) for rank in range(2)]
+    for manager in managers:
+        manager.vllm_config = _make_pcp_config(graph_mode)
+        if policy is not None:
+            manager.decode_balance_policy = policy
+    padding = dict(padded_num_tokens=2, padded_num_reqs=2) if graph_mode == CUDAGraphMode.FULL_DECODE_ONLY else {}
+
+    # Mutate the same metadata arrays between steps: cached owners must not
+    # leak into dispatch or survive a changed context-length distribution.
+    for computed, expected_owners in [([0, 9999, 0, 9999], [0, 0, 1, 1]), ([9999, 9999, 0, 0], [0, 1, 0, 1])]:
+        if policy != "load_balance":
+            expected_owners = [0, 1, 0, 1]
+        batch.num_computed_tokens_np[:] = computed
+        batch.prefill_len_np[:] = computed
+        batch.num_computed_prefill_tokens_np[:] = computed
+        batch.positions.copy_(torch.tensor(computed, dtype=torch.int64))
+        local_ids = []
+        for rank, manager in enumerate(managers):
+            _prepare_decode_plan(manager, batch)
+            assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 2
+            with (
+                patch("vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d", side_effect=_mock_async_copy_to_cpu),
+                patch("vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu", side_effect=_mock_async_copy_to_cpu),
+            ):
+                local = manager.partition_batch(batch, **padding)
+            expected = [idx for idx, owner in enumerate(expected_owners) if owner == rank]
+            assert local.req_ids == [batch.req_ids[idx] for idx in expected]
+            assert local.input_ids.tolist() == expected
+            assert local.positions.tolist() == [computed[idx] for idx in expected]
+            assert local.num_reqs == local.num_tokens == 2
+            assert manager._decode_owner_ranks is None
+            local_ids.append(local.input_ids.clone())
+        gathered_ids = torch.cat(local_ids)
+        for manager in managers:
+            torch.testing.assert_close(gathered_ids[manager._hidden_restore_idx], batch.input_ids)
+            torch.testing.assert_close(batch.input_ids[manager._padded_gather_idx], gathered_ids)
+            assert manager._gathered_kv_write_mask.tolist() == [True] * 4
+
+
+@pytest.mark.parametrize(
+    "pipeline_size,speculative,expected", [(1, True, [0, 0, 1, 1]), (2, False, [0, 0, 1, 1]), (2, True, [0, 1, 0, 1])]
+)
+def test_decode_balancing_preserves_speculative_pipeline_layout(pipeline_size, speculative, expected):
+    manager = AscendPCPManager(2, 0, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE, pipeline_parallel_size=pipeline_size)
+    if speculative:
+        manager.vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    batch = SimpleNamespace(
+        num_scheduled_tokens=np.ones(4, dtype=np.int32),
+        num_computed_tokens_np=np.array([0, 9999, 0, 9999], dtype=np.int32),
+        is_prefilling_np=np.zeros(4, dtype=np.bool_),
+    )
+    np.testing.assert_array_equal(
+        manager._balance_decode_owners(
+            batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+        ),
+        expected,
+    )
+    if pipeline_size > 1 and speculative:
+        # Another PP stage may have an optimistic, uncorrected CPU mirror.
+        batch.num_computed_tokens_np[:] = [9999, 9999, 0, 0]
+        np.testing.assert_array_equal(
+            manager._balance_decode_owners(
+                batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+            ),
+            expected,
+        )
+
+
+def _make_decode_plan_batch():
+    return SimpleNamespace(
+        req_ids=[f"req-{idx}" for idx in range(4)],
+        num_scheduled_tokens=np.array([8, 1, 8, 1], dtype=np.int32),
+        num_computed_tokens_np=np.array([100, 835, 100, 835], dtype=np.int32),
+        is_prefilling_np=np.zeros(4, dtype=np.bool_),
+    )
+
+
+def _make_decode_plan_manager():
+    manager = AscendPCPManager(2, 0, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
+    manager.decode_balance_policy = "load_balance"
+    return manager
+
+
+def test_decode_plan_dispatch_uses_balanced_maximum_and_immutable_snapshot():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 16
+    with patch.object(manager, "_balance_decode_owners", wraps=manager._balance_decode_owners) as balance:
+        _prepare_decode_plan(manager, batch)
+        for _ in range(2):
+            assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 9
+        balance.assert_called_once()
+    plan = manager._decode_partition_plan
+    assert plan is not None
+    assert plan.req_ids == tuple(batch.req_ids)
+    assert plan.owner_ranks.tolist() == [0, 0, 1, 1]
+    assert manager._decode_owner_ranks is None
+    for name in ("num_scheduled_tokens", "is_prefilling_np", "num_computed_tokens_np"):
+        saved = getattr(plan, name)
+        assert not np.shares_memory(saved, getattr(batch, name))
+        assert not saved.flags.writeable
+    assert not plan.owner_ranks.flags.writeable
+
+
+@pytest.mark.parametrize("field", ["num_scheduled_tokens", "is_prefilling_np"])
+def test_decode_plan_rejects_changed_dispatch_metadata(field):
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    _prepare_decode_plan(manager, batch)
+    getattr(batch, field)[0] = 1
+    with pytest.raises(RuntimeError, match="dispatch metadata changed"):
+        manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np)
+    assert manager._decode_partition_plan is None
+    assert manager._decode_owner_ranks is None
+
+
+@pytest.mark.parametrize("field", ["req_ids", "num_scheduled_tokens", "is_prefilling_np", "num_computed_tokens_np"])
+def test_decode_plan_rejects_changed_partition_metadata(field):
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    _prepare_decode_plan(manager, batch)
+    getattr(batch, field)[0] = "replacement" if field == "req_ids" else 1
+    with (
+        patch.object(PCPManager, "partition_batch") as parent,
+        pytest.raises(RuntimeError, match="partition metadata changed"),
+    ):
+        manager.partition_batch(batch)
+    parent.assert_not_called()
+    assert manager._decode_partition_plan is None
+    assert manager._decode_owner_ranks is None
+
+
+def test_partition_consumes_plan_without_recomputing_owners():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    _prepare_decode_plan(manager, batch)
+    owners = manager._decode_partition_plan.owner_ranks
+
+    def stop_after_layout(*args, **kwargs):
+        assert manager._decode_owner_ranks is owners
+        assert list(manager._iter_rank_chunks(0, batch.num_scheduled_tokens, batch.is_prefilling_np)) == [
+            (0, 0, 8),
+            (1, 0, 1),
+        ]
+        raise RuntimeError("stop after layout")
+
+    with (
+        patch.object(manager, "_balance_decode_owners", side_effect=AssertionError("must not recompute")),
+        patch.object(PCPManager, "partition_batch", side_effect=stop_after_layout),
+        pytest.raises(RuntimeError, match="stop after layout"),
+    ):
+        manager.partition_batch(batch, padded_num_tokens=12)
+    assert manager._decode_partition_plan is None
+    assert manager._decode_owner_ranks is None
+
+
+def test_unplanned_partition_retains_round_robin():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+
+    def stop_after_layout(*args, **kwargs):
+        assert list(manager._iter_rank_chunks(0, batch.num_scheduled_tokens, batch.is_prefilling_np)) == [
+            (0, 0, 8),
+            (2, 0, 8),
+        ]
+        raise RuntimeError("unplanned partition")
+
+    with (
+        patch.object(manager, "_balance_decode_owners", side_effect=AssertionError("must not plan after dispatch")),
+        patch.object(PCPManager, "partition_batch", side_effect=stop_after_layout),
+        pytest.raises(RuntimeError, match="unplanned partition"),
+    ):
+        manager.partition_batch(batch)
+
+
+def test_decode_plan_replaced_for_next_batch_and_cleared_on_planning_failure():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    _prepare_decode_plan(manager, batch)
+    batch.num_scheduled_tokens[:] = 1
+    _prepare_decode_plan(manager, batch)
+    assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 2
+    with (
+        patch.object(PCPManager, "get_num_tokens_for_dispatch", side_effect=RuntimeError("planning failed")),
+        pytest.raises(RuntimeError, match="planning failed"),
+    ):
+        _prepare_decode_plan(manager, batch)
+    assert manager._decode_partition_plan is None
+    assert manager._decode_owner_ranks is None

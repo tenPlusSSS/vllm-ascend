@@ -1377,6 +1377,31 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_pcp_decode_balance_policy_defaults_round_robin(self, mock_fix):
+        vc = VllmConfig()
+        self.assertEqual(init_ascend_config(vc).pcp_decode_balance_policy, "round_robin")
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_pcp_decode_balance_policy_accepts_supported_values(self, mock_fix):
+        for policy in ("round_robin", "load_balance"):
+            with self.subTest(policy=policy):
+                vc = VllmConfig()
+                vc.additional_config = {"pcp_decode_balance_policy": policy}
+                self.assertEqual(init_ascend_config(vc).pcp_decode_balance_policy, policy)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_pcp_decode_balance_policy_rejects_invalid_values(self, mock_fix):
+        for policy in ("", "length", "context", "CONTEXT", None, True, 1):
+            with self.subTest(policy=policy):
+                vc = VllmConfig()
+                vc.additional_config = {"pcp_decode_balance_policy": policy}
+                with self.assertRaisesRegex(ValueError, "pcp_decode_balance_policy"):
+                    init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_a_family_additional_config_gets_typed_validation(self, mock_fix):
         vc = VllmConfig()
         vc.additional_config = {

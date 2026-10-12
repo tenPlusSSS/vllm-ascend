@@ -433,6 +433,7 @@ class AscendConfig:
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
+            "pcp_decode_balance_policy": "round_robin",
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -574,6 +575,8 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    # MRV2 sharded decode ownership; balance query tokens and attention work.
+    pcp_decode_balance_policy: Literal["round_robin", "load_balance"] = "round_robin"
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this

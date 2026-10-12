@@ -10,6 +10,8 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
 from vllm_ascend.ascend_forward_context import MoECommType
@@ -21,13 +23,15 @@ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 def _make_runner(need_timing: bool = True):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.ascend_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing))
+        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+        pcp_decode_balance_policy="round_robin",
     )
     runner.vllm_config = SimpleNamespace()
     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
     runner.kvpp = SimpleNamespace(complete_forward=lambda: None)
     runner.model_state = SimpleNamespace(kvpp_is_dummy_run=False)
     runner.execute_model_state = None
+    runner.pcp_manager = None
     runner.is_last_pp_rank = False
     runner.attn_groups = []
     runner.adaptive_verification = None
@@ -54,6 +58,121 @@ def _make_batch_state(computed: list[int], scheduled: list[int], prefill_lens: l
         is_prefilling_np=is_prefilling,
         has_prefill=bool(is_prefilling.any()),
     )
+
+
+def _install_pcp_balance(runner):
+    manager = AscendPCPManager(2, 0, torch.device("cpu"))
+    manager.decode_balance_policy = "load_balance"
+    manager.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pcp_shard_decode_requests=True, pipeline_parallel_size=1),
+        speculative_config=None,
+    )
+    runner.pcp_manager = manager
+    return manager
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_decode_plan_precedes_graph_dispatch_and_dp_sync(dp_size):
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    state = _make_batch_state([100, 835, 100, 835], [8, 1, 8, 1], [1] * 4)
+    computed = np.zeros(4, dtype=np.int32)
+    runner.req_states = SimpleNamespace(num_computed_tokens_np=computed)
+
+    def correct_lengths(*args):
+        computed[:] = [100, 835, 100, 835]
+
+    with (
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(state, None)),
+        patch("vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled", return_value=False),
+        patch.object(runner, "_update_seq_lens_cpu", side_effect=correct_lengths) as update,
+        patch.object(manager, "_balance_decode_owners", wraps=manager._balance_decode_owners) as balance,
+    ):
+        gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
+    update.assert_called_once()
+    balance.assert_called_once()
+    np.testing.assert_array_equal(manager._decode_partition_plan.num_computed_tokens_np, computed)
+    assert manager._decode_partition_plan.owner_ranks.tolist() == [0, 0, 1, 1]
+    assert runner._pcp_seq_lens_batch is gathered
+
+    num_tokens = manager.get_num_tokens_for_dispatch(gathered.num_scheduled_tokens, gathered.is_prefilling_np)
+    assert num_tokens == 9
+    # A smaller local graph can be selected; another DP worker can still force
+    # a larger shared graph. Both must receive the planned count, not RR's 16.
+    local_desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 12, None)
+    synced_desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 16, None)
+    expected_sync = DPSyncState(torch.full((2,), 16), None, False, 4)
+    graph_manager = MagicMock()
+    graph_manager.dispatch.return_value = local_desc
+    with patch(
+        "vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding",
+        return_value=(synced_desc, expected_sync),
+    ) as sync:
+        desc, dp_sync = dispatch_cg_and_sync_dp(graph_manager, 4, num_tokens, uniform, dp_size, 0)
+    assert graph_manager.dispatch.call_args.args[1] == 9
+    if dp_size == 1:
+        sync.assert_not_called()
+        assert desc is local_desc and dp_sync is None
+    else:
+        assert sync.call_args.args[2] == 9
+        assert desc is synced_desc and dp_sync is expected_sync
+
+
+@pytest.mark.parametrize("case", ["round_robin", "replicated", "dummy", "adaptive"])
+def test_gather_skips_decode_planning_when_unavailable(case):
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    state = _make_batch_state([100, 835, 100, 835], [8, 1, 8, 1], [1] * 4)
+    scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"req-0": [1]})
+    if case == "round_robin":
+        manager.decode_balance_policy = "round_robin"
+    elif case == "replicated":
+        manager.vllm_config.parallel_config.pcp_shard_decode_requests = False
+    elif case == "adaptive":
+        runner.adaptive_verification = object()
+    manager._decode_partition_plan = object()  # Previous failed step must be cleared.
+    with (
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None if case == "dummy" else state, None)),
+        patch("vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled", return_value=False),
+        patch.object(runner, "_update_seq_lens_cpu") as update,
+        patch.object(manager, "prepare_decode_partition") as prepare,
+    ):
+        runner.gather_batch_req_state(scheduler, case == "dummy")
+    update.assert_not_called()
+    prepare.assert_not_called()
+    assert manager._decode_partition_plan is None
+    assert runner._pcp_seq_lens_batch is None
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_execute_model_clears_decode_plan_before_and_after_parent(fails):
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    manager._decode_partition_plan = object()
+    runner._pcp_seq_lens_batch = object()
+
+    def parent(*args, **kwargs):
+        assert manager._decode_partition_plan is None
+        assert runner._pcp_seq_lens_batch is None
+        manager._decode_partition_plan = object()
+        runner._pcp_seq_lens_batch = object()
+        if fails:
+            raise RuntimeError("dispatch failed")
+        return "empty or dummy output"
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", side_effect=parent),
+        patch("vllm_ascend.worker.v2.model_runner.has_kv_transfer_group", return_value=False),
+        patch("vllm_ascend.worker.v2.model_runner._start_profiling_chunk_timing", return_value=None),
+        patch("vllm_ascend.worker.v2.model_runner._finish_profiling_chunk_timing", return_value=None),
+    ):
+        if fails:
+            with pytest.raises(RuntimeError, match="dispatch failed"):
+                runner.execute_model(SimpleNamespace())
+        else:
+            assert runner.execute_model(SimpleNamespace(), dummy_run=True) == "empty or dummy output"
+    assert manager._decode_partition_plan is None
+    assert runner._pcp_seq_lens_batch is None
 
 
 def test_recompute_scheduler_reclassifies_pd_tail_in_mixed_decode_batch():
@@ -608,8 +727,10 @@ def test_sample_tokens_spec_pp_broadcasts_draft_tokens():
     runner.pp_handler.broadcast_drafts.assert_called_once_with()
 
 
-def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
+@pytest.mark.parametrize("decode_balance_policy", ["round_robin", "load_balance"])
+def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(decode_balance_policy):
     runner = _make_runner()
+    runner.ascend_config.pcp_decode_balance_policy = decode_balance_policy
     runner.input_buffers = object()
     runner.vllm_config = SimpleNamespace()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
@@ -651,6 +772,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
     assert runner.kvpp == "kvpp"
     assert runner.model_state.kvpp_runtime == "kvpp"
     assert runner.pcp_manager.vllm_config is runner.vllm_config
+    assert runner.pcp_manager.decode_balance_policy == decode_balance_policy
     assert runner.model_state.pcp_manager is runner.pcp_manager
     assert runner.speculator.pcp_manager is runner.pcp_manager
     runner.init_routed_experts_capturer.assert_called_once_with()
@@ -832,6 +954,28 @@ def _run_prepare_inputs(
         patch("vllm_ascend.worker.v2.model_runner.update_cos_sin"),
     ):
         return runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc), batch
+
+
+def test_planned_batch_corrects_speculative_cpu_lengths_only_once():
+    runner, scheduler_output, state, desc = _prepare_inputs_runner(speculator=True)
+    manager = _install_pcp_balance(runner)
+    # Real Ascend request state shares its CPU tensor and NumPy storage.
+    runner.req_states.num_computed_tokens_np = runner.req_states.num_computed_tokens_cpu.numpy()
+    with (
+        runner._pcp_decode_plan_scope(),
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(state, None)),
+        patch("vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled", return_value=False),
+        patch.object(runner, "_update_seq_lens_cpu", wraps=runner._update_seq_lens_cpu) as update,
+    ):
+        gathered, _ = runner.gather_batch_req_state(scheduler_output, False)
+        # r0 was corrected from 1 to 3 after rejection; r1 remains at 2.
+        np.testing.assert_array_equal(manager._decode_partition_plan.num_computed_tokens_np, [3, 2])
+        _run_prepare_inputs(runner, scheduler_output, gathered, desc)
+        update.assert_called_once_with(scheduler_output, state.req_ids)
+        runner.num_computed_tokens_event.synchronize.assert_called_once()
+        np.testing.assert_array_equal(runner.input_buffers.seq_lens_cpu[:2], [5, 4])
+    assert runner._pcp_seq_lens_batch is None
+    assert manager._decode_partition_plan is None
 
 
 def test_prepare_inputs_common_path():

@@ -19,6 +19,7 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 import torch
@@ -55,6 +56,18 @@ class AscendPCPAttentionContext:
     global_block_table_num_blocks: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class PCPDecodePartitionPlan:
+    """One CPU snapshot shared by graph/DP dispatch and batch partitioning."""
+
+    req_ids: tuple[str, ...]
+    num_scheduled_tokens: np.ndarray
+    is_prefilling_np: np.ndarray
+    num_computed_tokens_np: np.ndarray
+    owner_ranks: np.ndarray
+    max_num_tokens: int
+
+
 class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
@@ -65,6 +78,11 @@ class AscendPCPManager(PCPManager):
     _gathered_kv_slot_mappings: torch.Tensor | None
     _pad_slot_id: torch.Tensor
     _sampling_hidden_restored: bool = False
+    # Set from the validated Ascend config when the runner initializes PCP.
+    decode_balance_policy: Literal["round_robin", "load_balance"] = "round_robin"
+    _decode_partition_plan: PCPDecodePartitionPlan | None = None
+    # Only installed while traversing a plan's chunks; dispatch reads the plan.
+    _decode_owner_ranks: np.ndarray | None = None
     # The runner's global input buffers, which back global graph metadata.
     global_input_buffers: AscendInputBuffers | None = None
 
@@ -134,8 +152,8 @@ class AscendPCPManager(PCPManager):
         """Use the shared policy after the runner injects vllm_config."""
         return self.vllm_config.parallel_config.pcp_shard_decode_requests
 
-    # TODO: Remove replicated_requests and _iter_rank_chunks once the paired
-    # vLLM includes #52162, which shards decode requests upstream.
+    # TODO: Reuse upstream decode sharding once the paired vLLM includes #52162,
+    # retaining the load-balancing ownership policy below.
     def replicated_requests(self, num_scheduled_tokens: np.ndarray, is_prefilling: np.ndarray) -> np.ndarray:
         """Sharded decodes have a single owner, so none of them is replicated."""
         replicated = super().replicated_requests(num_scheduled_tokens, is_prefilling)
@@ -143,17 +161,156 @@ class AscendPCPManager(PCPManager):
             replicated &= np.asarray(is_prefilling, dtype=np.bool_)
         return replicated
 
+    @property
+    def decode_balance_enabled(self) -> bool:
+        return self.is_decode_sharded and self.decode_balance_policy == "load_balance"
+
+    def clear_decode_partition_plan(self) -> None:
+        self._decode_partition_plan = None
+        self._decode_owner_ranks = None
+
+    def prepare_decode_partition(
+        self,
+        req_ids: list[str],
+        num_scheduled_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray,
+    ) -> None:
+        """Plan once, before dispatch, using corrected CPU context lengths."""
+        self.clear_decode_partition_plan()
+        if not self.decode_balance_enabled:
+            return
+        counts = num_scheduled_tokens.copy()
+        prefilling = is_prefilling.copy()
+        computed = num_computed_tokens.copy()
+        owners = self._balance_decode_owners(counts, prefilling, computed)
+        self._decode_owner_ranks = owners
+        try:
+            max_num_tokens = super().get_num_tokens_for_dispatch(counts, prefilling)
+        finally:
+            self._decode_owner_ranks = None
+        # Keep the dispatch snapshot independent of mutable runner metadata.
+        for values in (counts, prefilling, computed, owners):
+            values.setflags(write=False)
+        self._decode_partition_plan = PCPDecodePartitionPlan(
+            tuple(req_ids), counts, prefilling, computed, owners, max_num_tokens
+        )
+
+    def get_num_tokens_for_dispatch(self, num_scheduled_tokens: np.ndarray, is_prefilling: np.ndarray) -> int:
+        plan = self._decode_partition_plan
+        if plan is None:
+            return super().get_num_tokens_for_dispatch(num_scheduled_tokens, is_prefilling)
+        if not (
+            np.array_equal(plan.num_scheduled_tokens, num_scheduled_tokens)
+            and np.array_equal(plan.is_prefilling_np, is_prefilling)
+        ):
+            self.clear_decode_partition_plan()
+            raise RuntimeError("PCP dispatch metadata changed after decode planning.")
+        return plan.max_num_tokens
+
+    def _balance_decode_owners(self, counts: np.ndarray, prefilling: np.ndarray, computed: np.ndarray) -> np.ndarray:
+        """Balance decode query tokens and attention with equal normalized weight.
+
+        Preserve each rank's decode request count and cap its total tokens at
+        the largest round-robin rank. Dispatch then uses the planned maximum,
+        which can be smaller. Uniform FULL-graph batches retain their sizes.
+        Prefill tokens only constrain capacity; they do not affect the score.
+        Only CPU metadata is read; the runner prepares one plan per step.
+        """
+        decode_indices = np.flatnonzero((counts > 0) & ~prefilling)
+        round_robin = np.full(len(counts), -1, dtype=np.int32)
+        round_robin[decode_indices] = np.arange(len(decode_indices)) % self.pcp_world_size
+        if len(decode_indices) <= 1 or self.pcp_world_size == 1:
+            return round_robin
+        if (
+            self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            and self.vllm_config.speculative_config is not None
+        ):
+            # Non-last PP stages do not universally correct CPU counts after
+            # draft rejection. Different lengths could produce different owner
+            # layouts for the hidden states sent between pipeline stages.
+            return round_robin
+
+        # Prefill only reserves dispatch space. Tail chunks may have different
+        # token counts even though PCP balances the overall prefill work.
+        prefill_tokens = [0] * self.pcp_world_size
+        if bool(prefilling.any()):
+            for rank in range(self.pcp_world_size):
+                for req_idx, _, query_len in self._iter_rank_chunks(rank, counts, prefilling):
+                    if prefilling[req_idx]:
+                        prefill_tokens[rank] += query_len
+
+        remaining = [0] * self.pcp_world_size
+        attention_work: dict[int, int] = {}
+        baseline_query_tokens = [0] * self.pcp_world_size
+        baseline_attention_work = [0] * self.pcp_world_size
+        # Sum visible KV positions for each decode query: q*c + q*(q+1)/2.
+        # Python integers avoid overflow for long contexts and large chunks.
+        for req_idx in decode_indices.tolist():
+            query_len = int(counts[req_idx])
+            work = query_len * int(computed[req_idx]) + query_len * (query_len + 1) // 2
+            attention_work[req_idx] = work
+            owner = int(round_robin[req_idx])
+            baseline_query_tokens[owner] += query_len
+            baseline_attention_work[owner] += work
+            remaining[owner] += 1
+
+        total_query_tokens = sum(baseline_query_tokens)
+        total_attention_work = sum(baseline_attention_work)
+        token_capacity = max(prefill + decode for prefill, decode in zip(prefill_tokens, baseline_query_tokens))
+        # score_r = Q_r / mean(Q) + A_r / mean(A). Multiply by the
+        # positive batch-wide factor total(Q)*total(A)/PCP to compare exact
+        # Python integers instead of floats. Both terms count decode only.
+        costs = {
+            idx: int(counts[idx]) * total_attention_work + work * total_query_tokens
+            for idx, work in attention_work.items()
+        }
+        rank_query_tokens = [0] * self.pcp_world_size
+        rank_costs = [0] * self.pcp_world_size
+        baseline_costs = [
+            query_tokens * total_attention_work + work * total_query_tokens
+            for query_tokens, work in zip(baseline_query_tokens, baseline_attention_work)
+        ]
+
+        owners = round_robin.copy()
+        # Stable request order and rank-order ties make every PCP rank derive
+        # the same owners without another collective.
+        for req_idx in sorted(costs, key=lambda idx: -costs[idx]):
+            query_len = int(counts[req_idx])
+            owner = min(
+                (
+                    rank
+                    for rank in range(self.pcp_world_size)
+                    if remaining[rank] > 0
+                    and prefill_tokens[rank] + rank_query_tokens[rank] + query_len <= token_capacity
+                ),
+                key=lambda rank: (rank_costs[rank], rank_query_tokens[rank]),
+                default=None,
+            )
+            if owner is None:
+                # Greedy placement can exhaust feasible slots even though the
+                # original assignment fits. Never exceed dispatch capacity.
+                return round_robin
+            owners[req_idx] = owner
+            remaining[owner] -= 1
+            rank_query_tokens[owner] += query_len
+            rank_costs[owner] += costs[req_idx]
+
+        # Capacity-constrained greedy assignment is a heuristic. Keep the
+        # existing order unless the estimated bottleneck actually improves.
+        return owners if max(rank_costs) < max(baseline_costs) else round_robin
+
     def _iter_rank_chunks(
         self,
         rank: int,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
     ) -> Iterator[tuple[int, int, int]]:
-        """Split prefills as upstream does and assign decodes round-robin.
+        """Split prefills upstream-style and emit this step's decode owners.
 
-        Only scheduled decodes count toward the round-robin order, which keeps
-        every step balanced. Ownership may change between steps because KV
-        and hidden states are gathered back to every PCP rank.
+        Dispatch reads the prepared plan's maximum; partitioning consumes that
+        plan's owners. Without a plan, decode stays round-robin. Owners may change
+        between steps because KV and hidden states are gathered on every PCP rank.
         """
         if not self.is_decode_sharded:
             yield from super()._iter_rank_chunks(rank, num_scheduled_tokens, is_prefilling)
@@ -169,6 +326,8 @@ class AscendPCPManager(PCPManager):
             if not is_prefilling[req_idx]:
                 owner_rank = decode_ordinal % self.pcp_world_size
                 decode_ordinal += 1
+                if self._decode_owner_ranks is not None:
+                    owner_rank = int(self._decode_owner_ranks[req_idx])
                 if rank == owner_rank:
                     yield req_idx, 0, query_len
                 continue
@@ -334,11 +493,26 @@ class AscendPCPManager(PCPManager):
         global_batch = input_batch
         # A sharded decode graph is sized per rank, so upstream can pad the
         # local requests. Replicated decode graphs are padded below instead.
-        local_batch = super().partition_batch(
-            global_batch,
-            padded_num_tokens=padded_num_tokens,
-            padded_num_reqs=padded_num_reqs if self.is_decode_sharded else None,
-        )
+        plan = self._decode_partition_plan
+        try:
+            if plan is not None:
+                if not (
+                    plan.req_ids == tuple(global_batch.req_ids)
+                    and np.array_equal(plan.num_scheduled_tokens, global_batch.num_scheduled_tokens)
+                    and np.array_equal(plan.is_prefilling_np, global_batch.is_prefilling_np)
+                    and np.array_equal(plan.num_computed_tokens_np, global_batch.num_computed_tokens_np)
+                ):
+                    raise RuntimeError("PCP partition metadata changed after decode planning.")
+                self._decode_owner_ranks = plan.owner_ranks
+            local_batch = super().partition_batch(
+                global_batch,
+                padded_num_tokens=padded_num_tokens,
+                padded_num_reqs=padded_num_reqs if self.is_decode_sharded else None,
+            )
+        finally:
+            # Never recompute owners after dispatch, even on a fallback path.
+            # A plan is consumed once; the next step must prepare a new one.
+            self.clear_decode_partition_plan()
         assert isinstance(local_batch, AscendInputBatch)
         if global_batch.num_draft_tokens > 0:
             local_batch = self._restore_draft_token_counts(global_batch, local_batch)

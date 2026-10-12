@@ -77,6 +77,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_flashcomm1`                 | bool | `False` | Whether to enable SP MoE. The legacy `VLLM_ASCEND_ENABLE_FLASHCOMM1` environment variable is kept for compatibility. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |
 | `enable_pcp_o_proj_weight_sharding`        | bool | `False` | Whether SFA-PCP shards the O-proj weight across the PCP group at load time and switches between PCP-local and gathered weight views at runtime. This option does not affect DSA-CP, whose original policy remains fixed: prefill gathers the full O-proj weight and decode uses the local weight. This option must be set when the server starts. |
 | `enable_pcp_embedding_lmhead_weight_sharding` | bool | `True` | Whether PCP shards embedding and LM Head weights across PCP ranks inside each TP shard. This option is enabled by default, takes effect when PCP size is greater than 1, and is incompatible with fine-grained TP for these modules. |
+| `pcp_decode_balance_policy`         | str | `"round_robin"` | MRV2 policy for assigning sharded decode requests to PCP ranks: `"round_robin"` or `"load_balance"`. Load balancing gives equal normalized weight to query tokens and estimated attention work within dispatch capacity. See the details below for scope and fallback behavior. |
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
@@ -87,6 +88,25 @@ The details of each configuration option are as follows:
 
 > [!WARNING]
 > With HDK 0.26.0 or earlier, `c8_enable_reshape_optim` may conflict with pooling models that use AICPU operators. Set `c8_enable_reshape_optim` to `false` to disable the optimization and avoid the conflict. See [issue #15896](https://github.com/vllm-project/vllm-ascend/issues/15896) for details.
+
+**pcp_decode_balance_policy**
+
+This option controls decode ownership in Model Runner V2 when decode requests are sharded across PCP ranks (`prefill_context_parallel_size > 1` and `decode_context_parallel_size == 1`). It does not change prefill partitioning or replicated decode execution.
+
+- `"round_robin"` (default) assigns scheduled decode requests to PCP ranks in batch order.
+- `"load_balance"` balances decode query tokens and estimated decode attention work with equal normalized weight. For a decode request with `q` scheduled tokens and `c` computed tokens, attention work is estimated as `A = q*c + q*(q+1)/2`. The rank score is `Q_rank / mean(Q) + A_rank / mean(A)`, where `Q_rank` and `A_rank` sum only decode query tokens and decode attention work on that rank; both means are taken across all PCP ranks. Prefill contributes neither to these sums nor to their normalization. This score is a scheduling heuristic, not a calibrated latency model.
+
+Load balancing preserves each rank's original decode request count but allows requests with different query lengths to exchange ranks. Each rank's total scheduled tokens, including its fixed prefill chunks, must stay within the largest round-robin rank's token count. This round-robin maximum is a placement constraint, not the final dispatch count. Prefill token counts are used only for this capacity check. Uniform FULL-graph batches retain their original request and token counts. Prefill partitioning stays unchanged. A batch keeps round-robin ownership if greedy placement cannot satisfy these constraints or the maximum combined decode rank score does not decrease. Improving the combined score does not guarantee a lower maximum decode attention estimate on its own.
+
+The runner prepares one partition plan after gathering batch metadata and correcting CPU context lengths, before graph dispatch and DP synchronization. Dispatch uses the maximum scheduled token count from this plan; partitioning validates the batch metadata and reuses its owners. Graph buckets and other DP workers may still require extra padding. Plans are cleared after partitioning and at the end of execution, including exceptional and no-forward paths. For speculative decoding, the existing CPU rejection-correction wait moves before planning and is not repeated for the same batch; this can change CPU/device overlap and should be profiled on the target hardware.
+
+Enable load balancing by adding this option to an existing MRV2 PCP deployment:
+
+```bash
+--additional-config '{"pcp_decode_balance_policy":"load_balance"}'
+```
+
+Set the value to `"round_robin"` or omit the option to use the default policy. When pipeline parallelism (`pipeline_parallel_size > 1`) and speculative decoding are both enabled, `"load_balance"` falls back to round-robin ownership because corrected CPU context lengths may differ across pipeline stages. Adaptive verification steps with scheduled draft tokens also retain round-robin ownership because their query layouts can change after dispatch. Dummy runs do not prepare a load-balancing plan.
 
 **xlite_graph_config**
 
