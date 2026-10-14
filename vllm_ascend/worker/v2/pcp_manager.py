@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -65,7 +66,13 @@ class PCPDecodePartitionPlan:
     is_prefilling_np: np.ndarray
     num_computed_tokens_np: np.ndarray
     owner_ranks: np.ndarray
+    per_rank_num_tokens: tuple[int, ...]
+    per_rank_num_decode_reqs: tuple[int, ...]
+    per_rank_num_prefill_segments: tuple[int, ...]
+    # Includes the one zero-token placeholder row of an empty rank.
+    per_rank_num_local_rows: tuple[int, ...]
     max_num_tokens: int
+    max_num_local_rows: int
 
 
 class AscendPCPManager(PCPManager):
@@ -80,6 +87,7 @@ class AscendPCPManager(PCPManager):
     _sampling_hidden_restored: bool = False
     # Set from the validated Ascend config when the runner initializes PCP.
     decode_balance_policy: Literal["round_robin", "load_balance"] = "round_robin"
+    decode_balance_token_factor: float = 1.5
     _decode_partition_plan: PCPDecodePartitionPlan | None = None
     # Only installed while traversing a plan's chunks; dispatch reads the plan.
     _decode_owner_ranks: np.ndarray | None = None
@@ -186,15 +194,35 @@ class AscendPCPManager(PCPManager):
         owners = self._balance_decode_owners(counts, prefilling, computed)
         self._decode_owner_ranks = owners
         try:
-            max_num_tokens = super().get_num_tokens_for_dispatch(counts, prefilling)
+            per_rank_tokens = []
+            per_rank_decodes = []
+            per_rank_prefills = []
+            per_rank_rows = []
+            for rank in range(self.pcp_world_size):
+                chunks = list(self._iter_rank_chunks(rank, counts, prefilling))
+                per_rank_tokens.append(sum(q for _, _, q in chunks))
+                per_rank_prefills.append(sum(bool(prefilling[idx]) for idx, _, _ in chunks))
+                per_rank_decodes.append(len(chunks) - per_rank_prefills[-1])
+                per_rank_rows.append(max(1, len(chunks)))
         finally:
             self._decode_owner_ranks = None
         # Keep the dispatch snapshot independent of mutable runner metadata.
         for values in (counts, prefilling, computed, owners):
             values.setflags(write=False)
         self._decode_partition_plan = PCPDecodePartitionPlan(
-            tuple(req_ids), counts, prefilling, computed, owners, max_num_tokens
+            req_ids=tuple(req_ids),
+            num_scheduled_tokens=counts,
+            is_prefilling_np=prefilling,
+            num_computed_tokens_np=computed,
+            owner_ranks=owners,
+            per_rank_num_tokens=tuple(per_rank_tokens),
+            per_rank_num_decode_reqs=tuple(per_rank_decodes),
+            per_rank_num_prefill_segments=tuple(per_rank_prefills),
+            per_rank_num_local_rows=tuple(per_rank_rows),
+            max_num_tokens=max(per_rank_tokens),
+            max_num_local_rows=max(per_rank_rows),
         )
+        self._validate_decode_plan_capacity()
 
     def get_num_tokens_for_dispatch(self, num_scheduled_tokens: np.ndarray, is_prefilling: np.ndarray) -> int:
         plan = self._decode_partition_plan
@@ -208,13 +236,108 @@ class AscendPCPManager(PCPManager):
             raise RuntimeError("PCP dispatch metadata changed after decode planning.")
         return plan.max_num_tokens
 
-    def _balance_decode_owners(self, counts: np.ndarray, prefilling: np.ndarray, computed: np.ndarray) -> np.ndarray:
-        """Balance decode query tokens and attention with equal normalized weight.
+    def get_num_reqs_for_dispatch(self, num_tokens: int, uniform_token_count: int | None) -> int:
+        """Return the same plan's local row maximum for graph/DP dispatch."""
+        plan = self._decode_partition_plan
+        assert plan is not None
+        if num_tokens != plan.max_num_tokens:
+            self.clear_decode_partition_plan()
+            raise RuntimeError("PCP dispatch token count does not match the decode plan.")
+        if uniform_token_count is not None and (
+            bool(plan.is_prefilling_np.any())
+            or not np.all(plan.num_scheduled_tokens == uniform_token_count)
+            or plan.max_num_local_rows * uniform_token_count != plan.max_num_tokens
+        ):
+            self.clear_decode_partition_plan()
+            raise RuntimeError("PCP uniform dispatch does not match the decode plan.")
+        return plan.max_num_local_rows
 
-        Preserve each rank's decode request count and cap its total tokens at
-        the largest round-robin rank. Dispatch then uses the planned maximum,
-        which can be smaller. Uniform FULL-graph batches retain their sizes.
-        Prefill tokens only constrain capacity; they do not affect the score.
+    def _get_local_request_capacity(self, num_global_reqs: int) -> int:
+        # At most two prefill segments or one decode row per global request.
+        # The logical bound also supports metadata-only managers without buffers.
+        capacity = max(1, 2 * num_global_reqs)
+        buffers = getattr(self, "_input_buffers", None)
+        if buffers is not None:
+            capacity = min(capacity, buffers.max_num_reqs)
+        block_tables = getattr(self, "_local_block_tables", None)
+        if block_tables is not None:
+            for table in block_tables:
+                capacity = min(capacity, table.shape[0])
+        return capacity
+
+    def _get_decode_token_budget(self, counts: np.ndarray) -> int:
+        """Candidate budget; round-robin fallback may exceed this soft limit."""
+        total_tokens = sum(map(int, counts))
+        # No rank can own more than the global total. Clamp the factor before
+        # multiplication so even a very large finite config cannot overflow.
+        factor = min(self.decode_balance_token_factor, self.pcp_world_size)
+        budget = math.ceil(total_tokens * (factor / self.pcp_world_size))
+        buffers = getattr(self, "_input_buffers", None)
+        if buffers is not None:
+            budget = min(budget, buffers.max_num_tokens)
+        return budget
+
+    def _validate_decode_plan_capacity(
+        self, padded_num_tokens: int | None = None, padded_num_reqs: int | None = None
+    ) -> None:
+        plan = self._decode_partition_plan
+        if plan is None:
+            return
+        try:
+            if padded_num_tokens is not None and padded_num_tokens < plan.max_num_tokens:
+                raise RuntimeError("PCP graph token capacity is smaller than the decode plan.")
+            if padded_num_reqs is not None and padded_num_reqs < plan.max_num_local_rows:
+                raise RuntimeError("PCP graph request capacity is smaller than the decode plan.")
+            rows = plan.max_num_local_rows if padded_num_reqs is None else padded_num_reqs
+            tokens = plan.max_num_tokens if padded_num_tokens is None else padded_num_tokens
+            # Padded graph rows can exceed twice the active request count, so
+            # check their physical capacity separately from placement's bound.
+            buffers = getattr(self, "_input_buffers", None)
+            if buffers is not None and (rows > buffers.max_num_reqs or tokens > buffers.max_num_tokens):
+                raise RuntimeError("PCP decode plan exceeds local input buffer capacity.")
+            block_tables = getattr(self, "_local_block_tables", None)
+            if block_tables is not None and any(rows > table.shape[0] for table in block_tables):
+                raise RuntimeError("PCP decode plan exceeds local block table row capacity.")
+        except RuntimeError:
+            self.clear_decode_partition_plan()
+            raise
+
+    def validate_decode_dispatch(self, batch_desc: BatchExecutionDescriptor) -> None:
+        """Check the final graph/DP descriptor before preparing global tensors."""
+        plan = self._decode_partition_plan
+        if plan is None:
+            return
+        self._validate_decode_plan_capacity(
+            batch_desc.num_tokens,
+            batch_desc.num_reqs if batch_desc.cg_mode == CUDAGraphMode.FULL else None,
+        )
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            q = batch_desc.uniform_token_count
+            if (
+                q is None
+                or q <= 0
+                or batch_desc.num_reqs is None
+                or bool(plan.is_prefilling_np.any())
+                or not np.all(plan.num_scheduled_tokens == q)
+                or batch_desc.num_reqs * q != batch_desc.num_tokens
+            ):
+                self.clear_decode_partition_plan()
+                raise RuntimeError("PCP FULL graph requires a matching uniform decode plan.")
+            if self.global_input_buffers is not None:
+                global_rows = self._get_global_graph_num_reqs(batch_desc.num_reqs, q)
+                if global_rows < len(plan.req_ids):
+                    self.clear_decode_partition_plan()
+                    raise RuntimeError("PCP FULL graph global request capacity is smaller than the decode plan.")
+
+    def _balance_decode_owners(self, counts: np.ndarray, prefilling: np.ndarray, computed: np.ndarray) -> np.ndarray:
+        """Balance decode attention work under request and token constraints.
+
+        Allow request counts to vary within local row capacity. Candidate token
+        counts are bounded by a factor of the global per-rank average and local
+        buffers. Dispatch reads both plan dimensions, including any larger FULL
+        graph demand. An infeasible budget keeps the round-robin layout instead.
+        Query tokens only constrain capacity; they are not part of the objective.
+        Prefill tokens reserve capacity but contribute no attention work.
         Only CPU metadata is read; the runner prepares one plan per step.
         """
         decode_indices = np.flatnonzero((counts > 0) & ~prefilling)
@@ -234,15 +357,21 @@ class AscendPCPManager(PCPManager):
         # Prefill only reserves dispatch space. Tail chunks may have different
         # token counts even though PCP balances the overall prefill work.
         prefill_tokens = [0] * self.pcp_world_size
+        prefill_rows = [0] * self.pcp_world_size
         if bool(prefilling.any()):
             for rank in range(self.pcp_world_size):
                 for req_idx, _, query_len in self._iter_rank_chunks(rank, counts, prefilling):
                     if prefilling[req_idx]:
                         prefill_tokens[rank] += query_len
+                        prefill_rows[rank] += 1
 
-        remaining = [0] * self.pcp_world_size
+        request_capacity = self._get_local_request_capacity(len(counts))
+        token_capacity = self._get_decode_token_budget(counts)
+        # Fixed prefill chunks can already exceed the average-based budget on
+        # a rank that receives no decodes. Check them before placing requests.
+        if any(tokens > token_capacity for tokens in prefill_tokens):
+            return round_robin
         attention_work: dict[int, int] = {}
-        baseline_query_tokens = [0] * self.pcp_world_size
         baseline_attention_work = [0] * self.pcp_world_size
         # Sum visible KV positions for each decode query: q*c + q*(q+1)/2.
         # Python integers avoid overflow for long contexts and large chunks.
@@ -251,54 +380,40 @@ class AscendPCPManager(PCPManager):
             work = query_len * int(computed[req_idx]) + query_len * (query_len + 1) // 2
             attention_work[req_idx] = work
             owner = int(round_robin[req_idx])
-            baseline_query_tokens[owner] += query_len
             baseline_attention_work[owner] += work
-            remaining[owner] += 1
 
-        total_query_tokens = sum(baseline_query_tokens)
-        total_attention_work = sum(baseline_attention_work)
-        token_capacity = max(prefill + decode for prefill, decode in zip(prefill_tokens, baseline_query_tokens))
-        # score_r = Q_r / mean(Q) + A_r / mean(A). Multiply by the
-        # positive batch-wide factor total(Q)*total(A)/PCP to compare exact
-        # Python integers instead of floats. Both terms count decode only.
-        costs = {
-            idx: int(counts[idx]) * total_attention_work + work * total_query_tokens
-            for idx, work in attention_work.items()
-        }
         rank_query_tokens = [0] * self.pcp_world_size
-        rank_costs = [0] * self.pcp_world_size
-        baseline_costs = [
-            query_tokens * total_attention_work + work * total_query_tokens
-            for query_tokens, work in zip(baseline_query_tokens, baseline_attention_work)
-        ]
+        rank_decode_reqs = [0] * self.pcp_world_size
+        rank_attention_work = [0] * self.pcp_world_size
 
         owners = round_robin.copy()
         # Stable request order and rank-order ties make every PCP rank derive
         # the same owners without another collective.
-        for req_idx in sorted(costs, key=lambda idx: -costs[idx]):
+        for req_idx in sorted(attention_work, key=lambda idx: -attention_work[idx]):
             query_len = int(counts[req_idx])
             owner = min(
                 (
                     rank
                     for rank in range(self.pcp_world_size)
-                    if remaining[rank] > 0
+                    if prefill_rows[rank] + rank_decode_reqs[rank] < request_capacity
                     and prefill_tokens[rank] + rank_query_tokens[rank] + query_len <= token_capacity
                 ),
-                key=lambda rank: (rank_costs[rank], rank_query_tokens[rank]),
+                key=lambda rank: rank_attention_work[rank],
                 default=None,
             )
             if owner is None:
-                # Greedy placement can exhaust feasible slots even though the
-                # original assignment fits. Never exceed dispatch capacity.
+                # Whole requests may not fit this budget, even if each one
+                # fits individually. Dispatch will size the fallback layout;
+                # only physical capacities remain hard limits in that case.
                 return round_robin
             owners[req_idx] = owner
-            remaining[owner] -= 1
+            rank_decode_reqs[owner] += 1
             rank_query_tokens[owner] += query_len
-            rank_costs[owner] += costs[req_idx]
+            rank_attention_work[owner] += attention_work[req_idx]
 
         # Capacity-constrained greedy assignment is a heuristic. Keep the
-        # existing order unless the estimated bottleneck actually improves.
-        return owners if max(rank_costs) < max(baseline_costs) else round_robin
+        # existing order unless the maximum decode attention work decreases.
+        return owners if max(rank_attention_work) < max(baseline_attention_work) else round_robin
 
     def _iter_rank_chunks(
         self,
@@ -503,6 +618,7 @@ class AscendPCPManager(PCPManager):
                     and np.array_equal(plan.num_computed_tokens_np, global_batch.num_computed_tokens_np)
                 ):
                     raise RuntimeError("PCP partition metadata changed after decode planning.")
+                self._validate_decode_plan_capacity(padded_num_tokens, padded_num_reqs)
                 self._decode_owner_ranks = plan.owner_ranks
             local_batch = super().partition_batch(
                 global_batch,

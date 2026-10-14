@@ -308,6 +308,7 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
                 self.pcp_manager.decode_balance_policy = self.ascend_config.pcp_decode_balance_policy
+                self.pcp_manager.decode_balance_token_factor = self.ascend_config.pcp_decode_balance_token_factor
                 self.pcp_manager.kv_cache_config = kv_cache_config
                 self.pcp_manager.global_input_buffers = self.input_buffers
                 self.model_state.pcp_manager = self.pcp_manager
@@ -486,9 +487,16 @@ class NPUModelRunner(GPUModelRunner):
         so we need to prepare seq_lens_cpu here.
         """
         self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
+        if self.pcp_manager is not None:
+            self.pcp_manager.validate_decode_dispatch(batch_desc)
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         graph_num_reqs = batch_desc.num_reqs
+        if self.pcp_manager is not None and batch_desc.cg_mode != CUDAGraphMode.FULL:
+            # Eager/PIECEWISE dispatch counts PCP-local rows. They can exceed
+            # the global request count when prefills split into two segments.
+            # Only FULL descriptors impose request padding on global inputs.
+            graph_num_reqs = None
         global_graph_num_reqs = (
             self.pcp_manager.get_global_graph_num_reqs(batch_desc) if self.pcp_manager is not None else None
         )

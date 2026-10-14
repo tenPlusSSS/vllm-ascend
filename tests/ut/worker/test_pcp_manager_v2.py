@@ -16,7 +16,9 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from dataclasses import replace
 from inspect import signature
+from math import ceil
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +27,7 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -1187,34 +1190,42 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
         # Greedy reaches 17/14, worse than round-robin's 16/15.
         (2, [1] * 6, [7, 5, 6, 4, 0, 3], [False] * 6, [0, 1, 0, 1, 0, 1]),
         (2, [4] * 4, [0, 10**9, 0, 10**9], [False] * 4, [0, 0, 1, 1]),
-        # Equal attention work alone cannot improve RR's 16/2 query tokens.
-        (2, [8, 1, 8, 1], [100, 835, 100, 835], [False] * 4, [0, 0, 1, 1]),
-        # Normalized integer scores exceed int64 for this long-query case.
-        (2, [65536] * 4, [0, 10**9, 0, 10**9], [False] * 4, [0, 0, 1, 1]),
-        # Greedy reaches 13/13 tokens, leaving no room for q=4 under cap=16.
+        # Attention is already balanced: improving Q alone must not move owners.
+        (2, [8, 1, 8, 1], [100, 835, 100, 835], [False] * 4, [0, 1, 0, 1]),
+        # Attention improves from 1672/202 to 937/937; tokens also fit at 9/9.
+        (2, [8, 1, 8, 1], [100, 100, 100, 100], [False] * 4, [0, 0, 1, 1]),
+        # Synthetic attention work exceeds int64; use Python integer arithmetic.
+        (2, [65536] * 4, [0, 2**62, 0, 2**62], [False] * 4, [0, 0, 1, 1]),
+        # Variable query lengths can use a 2/4 request split within budget 12.
+        (2, [1, 4, 3, 2, 2, 4], [0, 6, 2, 0, 5, 9], [False] * 6, [1, 1, 0, 1, 1, 0]),
+        # Equal rank attention is resolved by rank order, not accumulated Q.
+        (2, [4, 1, 1, 1, 2, 1], [0, 6, 9, 1, 2, 5], [False] * 6, [0, 0, 1, 1, 1, 0]),
+        # Budget ceil(1.5 * 6/2)=5 permits isolating the long request.
+        (2, [1] * 6, [9999, 9, 9, 9, 9, 9], [False] * 6, [0, 1, 1, 1, 1, 1]),
+        # Greedy fits budget 24, but its maximum attention is worse than RR.
         (2, [8, 6, 7, 5, 1, 4], [100] * 6, [False] * 6, [0, 1, 0, 1, 0, 1]),
-        (2, [1, 1, 2, 2], [0, 100, 0, 100], [False] * 4, [0, 1, 1, 0]),
-        # Prefill cannot improve the decode-only score by swapping two decodes.
+        (2, [1, 1, 2, 2], [0, 100, 0, 100], [False] * 4, [1, 1, 1, 0]),
+        # Prefill cannot improve decode attention by swapping two decodes.
         (2, [5, 1, 1], [0, 0, 10], [True, False, False], [-1, 0, 1]),
-        # Equal prefill chunks must not dilute either decode normalization term.
+        # Prefill context lengths do not contribute to the attention objective.
         (2, [8, 8, 4, 6, 8], [176, 65, 232, 34, 0], [False] * 4 + [True], [0, 1, 1, 0, -1]),
         (2, [8, 8, 4, 6, 8], [176, 65, 232, 34, 10**6], [False] * 4 + [True], [0, 1, 1, 0, -1]),
-        # Ignoring prefill's 2/3 tokens would allow 4/6 total tokens under cap=5.
-        (2, [5, 2, 1, 1, 1], [0, 99, 999, 9, 0], [True] + [False] * 4, [-1, 0, 1, 0, 1]),
+        # Prefill's 2/3 tokens count toward the average-based total budget of 8.
+        (2, [5, 2, 1, 1, 1], [0, 99, 999, 9, 0], [True] + [False] * 4, [-1, 1, 0, 1, 1]),
         (8, [0, 1, 0, 1], [100, 1, 100, 100], [False] * 4, [-1, 0, -1, 1]),
         (2, [0, 5], [0, 10], [False, True], [-1, -1]),
         (1, [1, 1], [1, 100], [False, False], [0, 0]),
         (2, [], [], [], []),
     ],
 )
-def test_decode_owners_balance_queries_and_attention_within_capacity(
+def test_decode_owners_balance_attention_within_request_and_token_constraints(
     world_size, counts, computed, prefilling, expected
 ):
     manager = AscendPCPManager(world_size, 0, torch.device("cpu"))
     manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
     batch = SimpleNamespace(
         num_scheduled_tokens=np.array(counts, dtype=np.int32),
-        num_computed_tokens_np=np.array(computed, dtype=np.int32),
+        num_computed_tokens_np=np.array(computed, dtype=np.int64),
         is_prefilling_np=np.array(prefilling, dtype=np.bool_),
     )
     original_arrays = [value.copy() for value in vars(batch).values()]
@@ -1223,6 +1234,17 @@ def test_decode_owners_balance_queries_and_attention_within_capacity(
         batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
     )
     np.testing.assert_array_equal(owners, expected)
+    decode_indices = [idx for idx, q in enumerate(counts) if q > 0 and not prefilling[idx]]
+    before_work = [0] * world_size
+    after_work = [0] * world_size
+    for ordinal, idx in enumerate(decode_indices):
+        work = counts[idx] * computed[idx] + counts[idx] * (counts[idx] + 1) // 2
+        before_work[ordinal % world_size] += work
+        after_work[int(owners[idx])] += work
+    assert max(after_work) <= max(before_work)
+    round_robin = np.full(len(counts), -1, dtype=np.int32)
+    round_robin[decode_indices] = np.arange(len(decode_indices)) % world_size
+    token_limit = dispatch_capacity if np.array_equal(owners, round_robin) else ceil(1.5 * sum(counts) / world_size)
     for rank in range(world_size):
         manager.pcp_rank = rank
         np.testing.assert_array_equal(
@@ -1238,21 +1260,23 @@ def test_decode_owners_balance_queries_and_attention_within_capacity(
         finally:
             manager._decode_owner_ranks = None
         assert [chunk for chunk in after if prefilling[chunk[0]]] == [chunk for chunk in before if prefilling[chunk[0]]]
-        # Query lengths can move between ranks, but request counts and the
-        # dispatch token upper bound remain safe, including mixed batches.
-        assert len(after) == len(before)
-        assert sum(chunk[2] for chunk in after) <= dispatch_capacity
-        if len(set(counts)) <= 1:
-            assert sum(chunk[2] for chunk in after) == sum(chunk[2] for chunk in before)
+        # Changed layouts fit the candidate budget. Round-robin fallback may
+        # exceed it; both paths still account for prefill rows and tokens.
+        assert max(1, len(after)) <= manager._get_local_request_capacity(len(counts))
+        assert sum(chunk[2] for chunk in after) <= token_limit
         assert [chunk[0] for chunk in after if not prefilling[chunk[0]]] == np.flatnonzero(owners == rank).tolist()
     for actual, original in zip(vars(batch).values(), original_arrays, strict=True):
         np.testing.assert_array_equal(actual, original)
 
 
-@pytest.mark.parametrize("padded_num_tokens", [None, 9, 12, 16])
-def test_query_balancing_preserves_speculative_inputs_and_dispatch_capacity(padded_num_tokens):
+@pytest.mark.parametrize("padded_num_tokens", [None, 12, 16])
+@pytest.mark.parametrize("relaxed", [False, True])
+def test_attention_balancing_preserves_speculative_inputs_and_dispatch_capacity(padded_num_tokens, relaxed):
     counts = np.array([8, 1, 8, 1], dtype=np.int32)
-    computed = np.array([100, 835, 100, 835], dtype=np.int32)
+    computed = np.array([100, 100, 100, 100], dtype=np.int32)
+    if relaxed:
+        computed[:] = [200, 100, 100, 200]
+    planned_max = 10 if relaxed else 9
     buffers = AscendInputBuffers(4, 18, torch.device("cpu"))
     base = InputBatch.make_dummy(4, 18, buffers, max_query_len=8)
     batch = AscendInputBatch(**base.__dict__, seq_lens_np=computed + counts)
@@ -1282,18 +1306,23 @@ def test_query_balancing_preserves_speculative_inputs_and_dispatch_capacity(padd
         manager.decode_balance_policy = "load_balance"
         assert manager.get_num_tokens_for_dispatch(counts, batch.is_prefilling_np) == 16
         _prepare_decode_plan(manager, batch)
-        assert manager.get_num_tokens_for_dispatch(counts, batch.is_prefilling_np) == 9
+        assert manager.get_num_tokens_for_dispatch(counts, batch.is_prefilling_np) == planned_max
+        expected_indices = ([0] if rank == 0 else [1, 2, 3]) if relaxed else [2 * rank, 2 * rank + 1]
+        expected_tokens = int(counts[expected_indices].sum())
         with patch("vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d", side_effect=_mock_async_copy_to_cpu):
             local = manager.partition_batch(batch, padded_num_tokens=padded_num_tokens)
-        assert local.num_reqs == 2
-        assert local.num_tokens == 9
-        assert local.num_tokens_after_padding == (padded_num_tokens or 9)
-        assert local.req_ids == batch.req_ids[2 * rank : 2 * rank + 2]
-        assert local.num_scheduled_tokens.tolist() == [8, 1]
-        assert local.num_draft_tokens_per_req.tolist() == [7, 0]
+        assert local.num_reqs == len(expected_indices)
+        assert local.num_tokens == expected_tokens
+        assert local.num_tokens_after_padding == (padded_num_tokens or planned_max)
+        assert local.req_ids == [batch.req_ids[i] for i in expected_indices]
+        assert local.num_scheduled_tokens.tolist() == counts[expected_indices].tolist()
+        assert local.num_draft_tokens_per_req.tolist() == (counts[expected_indices] - 1).tolist()
         assert local.num_draft_tokens == 7
-        torch.testing.assert_close(local.input_ids[:9], batch.input_ids[9 * rank : 9 * (rank + 1)])
-        torch.testing.assert_close(local.positions[:9], batch.positions[9 * rank : 9 * (rank + 1)])
+        token_indices = np.concatenate(
+            [np.arange(batch.query_start_loc_np[i], batch.query_start_loc_np[i + 1]) for i in expected_indices]
+        )
+        torch.testing.assert_close(local.input_ids[:expected_tokens], batch.input_ids[token_indices])
+        torch.testing.assert_close(local.positions[:expected_tokens], batch.positions[token_indices])
         assert manager._decode_owner_ranks is None
         assert manager._decode_partition_plan is None
         local_ids.append(local.input_ids.clone())
@@ -1366,11 +1395,14 @@ def test_balanced_partition_restores_global_order_across_steps(graph_mode, polic
         manager.vllm_config = _make_pcp_config(graph_mode)
         if policy is not None:
             manager.decode_balance_policy = policy
-    padding = dict(padded_num_tokens=2, padded_num_reqs=2) if graph_mode == CUDAGraphMode.FULL_DECODE_ONLY else {}
 
     # Mutate the same metadata arrays between steps: cached owners must not
     # leak into dispatch or survive a changed context-length distribution.
-    for computed, expected_owners in [([0, 9999, 0, 9999], [0, 0, 1, 1]), ([9999, 9999, 0, 0], [0, 1, 0, 1])]:
+    for computed, expected_owners in [
+        ([0, 9999, 0, 9999], [0, 0, 1, 1]),
+        ([9999, 9999, 0, 0], [0, 1, 0, 1]),
+        ([899, 399, 99, 399], [0, 1, 1, 1]),
+    ]:
         if policy != "load_balance":
             expected_owners = [0, 1, 0, 1]
         batch.num_computed_tokens_np[:] = computed
@@ -1378,9 +1410,18 @@ def test_balanced_partition_restores_global_order_across_steps(graph_mode, polic
         batch.num_computed_prefill_tokens_np[:] = computed
         batch.positions.copy_(torch.tensor(computed, dtype=torch.int64))
         local_ids = []
+        planned_max = max(expected_owners.count(rank) for rank in range(2))
+        graph_size = 4 if planned_max == 3 else 2
+        padding = (
+            dict(padded_num_tokens=graph_size, padded_num_reqs=graph_size)
+            if graph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            else {}
+        )
         for rank, manager in enumerate(managers):
             _prepare_decode_plan(manager, batch)
-            assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 2
+            assert (
+                manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == planned_max
+            )
             with (
                 patch("vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d", side_effect=_mock_async_copy_to_cpu),
                 patch("vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu", side_effect=_mock_async_copy_to_cpu),
@@ -1388,16 +1429,17 @@ def test_balanced_partition_restores_global_order_across_steps(graph_mode, polic
                 local = manager.partition_batch(batch, **padding)
             expected = [idx for idx, owner in enumerate(expected_owners) if owner == rank]
             assert local.req_ids == [batch.req_ids[idx] for idx in expected]
-            assert local.input_ids.tolist() == expected
-            assert local.positions.tolist() == [computed[idx] for idx in expected]
-            assert local.num_reqs == local.num_tokens == 2
+            assert local.input_ids[: local.num_tokens].tolist() == expected
+            assert local.positions[: local.num_tokens].tolist() == [computed[idx] for idx in expected]
+            assert local.num_reqs == local.num_tokens == len(expected)
             assert manager._decode_owner_ranks is None
             local_ids.append(local.input_ids.clone())
         gathered_ids = torch.cat(local_ids)
         for manager in managers:
             torch.testing.assert_close(gathered_ids[manager._hidden_restore_idx], batch.input_ids)
-            torch.testing.assert_close(batch.input_ids[manager._padded_gather_idx], gathered_ids)
-            assert manager._gathered_kv_write_mask.tolist() == [True] * 4
+            valid = manager._gathered_kv_write_mask
+            torch.testing.assert_close(batch.input_ids[manager._padded_gather_idx[valid]], gathered_ids[valid])
+            assert int(valid.sum()) == 4
 
 
 @pytest.mark.parametrize(
@@ -1434,7 +1476,7 @@ def _make_decode_plan_batch():
     return SimpleNamespace(
         req_ids=[f"req-{idx}" for idx in range(4)],
         num_scheduled_tokens=np.array([8, 1, 8, 1], dtype=np.int32),
-        num_computed_tokens_np=np.array([100, 835, 100, 835], dtype=np.int32),
+        num_computed_tokens_np=np.array([100, 100, 100, 100], dtype=np.int32),
         is_prefilling_np=np.zeros(4, dtype=np.bool_),
     )
 
@@ -1444,6 +1486,17 @@ def _make_decode_plan_manager():
     manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
     manager.decode_balance_policy = "load_balance"
     return manager
+
+
+def test_attention_tie_keeps_round_robin_despite_better_query_balance():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    batch.num_computed_tokens_np[:] = [100, 835, 100, 835]
+    # Every request has A=836. Both RR (16/2 tokens) and a 9/9-token layout
+    # reach 1672/1672 attention work, so the objective does not improve.
+    _prepare_decode_plan(manager, batch)
+    assert manager._decode_partition_plan.owner_ranks.tolist() == [0, 1, 0, 1]
+    assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 16
 
 
 def test_decode_plan_dispatch_uses_balanced_maximum_and_immutable_snapshot():
@@ -1459,6 +1512,11 @@ def test_decode_plan_dispatch_uses_balanced_maximum_and_immutable_snapshot():
     assert plan is not None
     assert plan.req_ids == tuple(batch.req_ids)
     assert plan.owner_ranks.tolist() == [0, 0, 1, 1]
+    assert plan.per_rank_num_tokens == (9, 9)
+    assert plan.per_rank_num_decode_reqs == (2, 2)
+    assert plan.per_rank_num_prefill_segments == (0, 0)
+    assert plan.per_rank_num_local_rows == (2, 2)
+    assert plan.max_num_local_rows == 2
     assert manager._decode_owner_ranks is None
     for name in ("num_scheduled_tokens", "is_prefilling_np", "num_computed_tokens_np"):
         saved = getattr(plan, name)
@@ -1546,9 +1604,182 @@ def test_decode_plan_replaced_for_next_batch_and_cleared_on_planning_failure():
     _prepare_decode_plan(manager, batch)
     assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 2
     with (
-        patch.object(PCPManager, "get_num_tokens_for_dispatch", side_effect=RuntimeError("planning failed")),
+        patch.object(manager, "_iter_rank_chunks", side_effect=RuntimeError("planning failed")),
         pytest.raises(RuntimeError, match="planning failed"),
     ):
         _prepare_decode_plan(manager, batch)
     assert manager._decode_partition_plan is None
     assert manager._decode_owner_ranks is None
+
+
+@pytest.mark.parametrize("row_capacity", [2, 3])
+@pytest.mark.parametrize("limiter", ["input_buffers", "block_tables"])
+def test_request_relaxation_respects_physical_rows_and_average_token_budget(row_capacity, limiter):
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    batch.num_computed_tokens_np[:] = [200, 100, 100, 200]
+    if limiter == "input_buffers":
+        manager._input_buffers = SimpleNamespace(max_num_reqs=row_capacity, max_num_tokens=16)
+    else:
+        manager._local_block_tables = (torch.zeros(row_capacity, 1),)
+    _prepare_decode_plan(manager, batch)
+    plan = manager._decode_partition_plan
+    if row_capacity == 2:
+        assert plan.owner_ranks.tolist() == [0, 0, 1, 1]
+        assert plan.per_rank_num_decode_reqs == (2, 2)
+        assert plan.per_rank_num_tokens == (9, 9)
+    else:
+        assert plan.owner_ranks.tolist() == [0, 1, 1, 1]
+        assert plan.per_rank_num_decode_reqs == (1, 3)
+        assert plan.per_rank_num_tokens == (8, 10)
+    assert plan.max_num_tokens <= 14  # ceil(1.5 * 18 / 2), below the old RR limit of 16.
+    assert manager.get_num_reqs_for_dispatch(plan.max_num_tokens, None) == row_capacity
+
+
+def test_request_plan_counts_prefill_segments_and_empty_rank_placeholders():
+    manager = _make_decode_plan_manager()
+    manager.prepare_decode_partition(
+        ["p0", "p1"], np.array([8, 8]), np.array([True, True]), np.zeros(2, dtype=np.int32)
+    )
+    plan = manager._decode_partition_plan
+    assert plan.per_rank_num_decode_reqs == (0, 0)
+    assert plan.per_rank_num_prefill_segments == (4, 4)
+    assert plan.per_rank_num_local_rows == (4, 4)
+    assert manager.get_num_reqs_for_dispatch(8, None) == 4  # Two global requests, four local rows.
+
+    manager.prepare_decode_partition(["d0"], np.array([1]), np.array([False]), np.array([10]))
+    plan = manager._decode_partition_plan
+    assert plan.per_rank_num_decode_reqs == (1, 0)
+    assert plan.per_rank_num_local_rows == (1, 1)
+    assert plan.per_rank_num_tokens == (1, 0)
+    assert manager.get_num_reqs_for_dispatch(1, 1) == 1
+
+
+@pytest.mark.parametrize("tokens,uniform", [(8, None), (9, 1)])
+def test_request_dispatch_rejects_inconsistent_plan_dimensions(tokens, uniform):
+    manager = _make_decode_plan_manager()
+    _prepare_decode_plan(manager, _make_decode_plan_batch())
+    with pytest.raises(RuntimeError, match="dispatch.*decode plan"):
+        manager.get_num_reqs_for_dispatch(tokens, uniform)
+    assert manager._decode_partition_plan is None
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_request_plan_accepts_compatible_final_graph_descriptor(mode):
+    manager = _make_decode_plan_manager()
+    manager.prepare_decode_partition(
+        ["d0", "d1", "d2"], np.ones(3, dtype=np.int32), np.zeros(3, dtype=np.bool_), np.array([99, 1, 1])
+    )
+    manager.global_input_buffers = SimpleNamespace(max_num_reqs=4, max_num_tokens=4)
+    desc = BatchExecutionDescriptor(mode, 2, None if mode == CUDAGraphMode.PIECEWISE else 2, 1)
+    manager.validate_decode_dispatch(desc)
+    assert manager.get_num_reqs_for_dispatch(2, 1) == 2
+
+
+@pytest.mark.parametrize("failure", ["tokens", "requests", "uniform", "global", "buffers", "blocks"])
+def test_request_plan_rejects_undersized_or_incompatible_final_descriptor(failure):
+    manager = _make_decode_plan_manager()
+    manager.prepare_decode_partition(
+        ["d0", "d1", "d2"], np.ones(3, dtype=np.int32), np.zeros(3, dtype=np.bool_), np.array([99, 1, 1])
+    )
+    desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, 1)
+    if failure == "tokens":
+        desc = replace(desc, num_tokens=1)
+    elif failure == "requests":
+        desc = replace(desc, num_reqs=1)
+    elif failure == "uniform":
+        desc = replace(desc, uniform_token_count=None)
+    elif failure == "global":
+        manager.global_input_buffers = SimpleNamespace(max_num_reqs=2, max_num_tokens=4)
+    elif failure == "buffers":
+        manager._input_buffers = SimpleNamespace(max_num_reqs=2, max_num_tokens=2)
+        desc = replace(desc, num_tokens=3, num_reqs=3)
+    else:
+        manager._local_block_tables = (torch.zeros(2, 1),)
+        desc = replace(desc, num_tokens=3, num_reqs=3)
+    with pytest.raises(RuntimeError, match="PCP"):
+        manager.validate_decode_dispatch(desc)
+    assert manager._decode_partition_plan is None
+
+
+def test_partition_checks_request_capacity_before_parent():
+    manager = _make_decode_plan_manager()
+    batch = _make_decode_plan_batch()
+    _prepare_decode_plan(manager, batch)
+    with patch.object(PCPManager, "partition_batch") as parent, pytest.raises(RuntimeError, match="request capacity"):
+        manager.partition_batch(batch, padded_num_tokens=12, padded_num_reqs=1)
+    parent.assert_not_called()
+    assert manager._decode_partition_plan is None
+
+
+@pytest.mark.parametrize("factor,expected", [(1.0, 9), (1.5, 14), (2.0, 18), (1e308, 18)])
+def test_average_token_budget_is_independent_of_request_order(factor, expected):
+    manager = _make_decode_plan_manager()
+    manager.decode_balance_token_factor = factor
+    for counts in ([8, 1, 8, 1], [8, 8, 1, 1]):
+        assert manager._get_decode_token_budget(np.array(counts)) == expected
+    manager._input_buffers = SimpleNamespace(max_num_tokens=10)
+    assert manager._get_decode_token_budget(np.array([8, 1, 8, 1])) == min(expected, 10)
+
+
+@pytest.mark.parametrize(
+    "factor,buffer_capacity,expected_tokens", [(1.0, 4, (2, 2)), (1.5, 4, (1, 3)), (1.5, 2, (2, 2))]
+)
+def test_average_token_budget_relaxes_uniform_decode_within_physical_capacity(factor, buffer_capacity, expected_tokens):
+    manager = _make_decode_plan_manager()
+    manager.decode_balance_token_factor = factor
+    manager._input_buffers = SimpleNamespace(max_num_reqs=8, max_num_tokens=buffer_capacity)
+    manager.global_input_buffers = SimpleNamespace(max_num_reqs=4, max_num_tokens=4)
+    manager.prepare_decode_partition(
+        ["d0", "d1", "d2", "d3"], np.ones(4, dtype=np.int32), np.zeros(4, dtype=np.bool_), np.array([899, 399, 99, 399])
+    )
+    plan = manager._decode_partition_plan
+    assert plan.per_rank_num_tokens == expected_tokens
+    assert plan.per_rank_num_decode_reqs == expected_tokens
+    assert manager.get_num_reqs_for_dispatch(max(expected_tokens), 1) == max(expected_tokens)
+    # A larger uniform FULL descriptor is valid when the plan now needs 3 rows.
+    padded = buffer_capacity
+    manager.validate_decode_dispatch(BatchExecutionDescriptor(CUDAGraphMode.FULL, padded, padded, 1))
+    assert manager.get_global_graph_num_reqs(BatchExecutionDescriptor(CUDAGraphMode.FULL, padded, padded, 1)) == 4
+
+
+@pytest.mark.parametrize("case", ["large_request", "indivisible", "prefill"])
+def test_infeasible_average_budget_plans_round_robin_fallback(case):
+    if case == "large_request":
+        world, factor, counts, computed, prefilling = 4, 1.5, [8, 1], [100, 100], [False, False]
+        expected_budget, expected_max = 4, 8
+    elif case == "indivisible":
+        world, factor, counts, computed, prefilling = 2, 1.0, [3, 3, 2], [100, 99, 1], [False] * 3
+        expected_budget, expected_max = 4, 5
+    else:
+        # Fixed prefills alone overflow rank 0's budget. Other ranks could fit
+        # an attention-improving decode layout, so check prefills before greedy.
+        world, factor, counts = 4, 1.0, [1] * 12
+        computed, prefilling = [0] * 4 + [999, 1, 1, 1, 999, 1, 1, 1], [True] * 4 + [False] * 8
+        expected_budget, expected_max = 3, 6
+    manager = _make_decode_plan_manager()
+    manager.pcp_world_size = world
+    manager.decode_balance_token_factor = factor
+    counts, prefilling = np.array(counts), np.array(prefilling)
+    manager.prepare_decode_partition([str(i) for i in range(len(counts))], counts, prefilling, np.array(computed))
+    plan = manager._decode_partition_plan
+    expected_owners = np.full(len(counts), -1)
+    expected_owners[~prefilling] = np.arange(int((~prefilling).sum())) % world
+    np.testing.assert_array_equal(plan.owner_ranks, expected_owners)
+    assert manager._get_decode_token_budget(counts) == expected_budget
+    assert plan.max_num_tokens == expected_max > expected_budget
+    assert manager.get_num_tokens_for_dispatch(counts, prefilling) == expected_max
+    manager.validate_decode_dispatch(
+        BatchExecutionDescriptor(CUDAGraphMode.NONE, expected_max, plan.max_num_local_rows)
+    )
+
+
+def test_relaxed_uniform_plan_rejects_old_round_robin_graph():
+    manager = _make_decode_plan_manager()
+    manager.prepare_decode_partition(
+        ["d0", "d1", "d2", "d3"], np.ones(4, dtype=np.int32), np.zeros(4, dtype=np.bool_), np.array([899, 399, 99, 399])
+    )
+    assert manager._decode_partition_plan.max_num_tokens == 3
+    with pytest.raises(RuntimeError, match="token capacity"):
+        manager.validate_decode_dispatch(BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, 1))
+    assert manager._decode_partition_plan is None

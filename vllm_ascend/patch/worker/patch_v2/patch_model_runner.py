@@ -10,15 +10,27 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_
 from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
 
 
-# TODO: Remove once upstream GPUModelRunner dispatches sharded PCP decode with
-# rank-local request counts.
+# TODO: Use upstream dispatch once GPUModelRunner can consume both token and
+# request dimensions from the precomputed PCP partition plan.
 def dispatch_cg_and_sync_dp(cudagraph_manager, num_reqs, num_tokens, uniform_token_count, *args, **kwargs):
     parallel_config = kwargs.get("parallel_config")
-    if uniform_token_count and parallel_config is not None and parallel_config.pcp_shard_decode_requests:
+    runner = getattr(cudagraph_manager, "model_runner", None)
+    pcp_manager = getattr(runner, "pcp_manager", None)
+    has_plan = pcp_manager is not None and getattr(pcp_manager, "_decode_partition_plan", None) is not None
+    if has_plan:
+        # Both maxima come from the same owner snapshot. Local rows include
+        # prefill segments and empty-rank placeholders, not just decode requests.
+        num_reqs = pcp_manager.get_num_reqs_for_dispatch(num_tokens, uniform_token_count)
+    elif uniform_token_count and parallel_config is not None and parallel_config.pcp_shard_decode_requests:
         # num_tokens is already the largest rank-local count, and each sharded
         # decode request stays whole on one rank.
         num_reqs = num_tokens // uniform_token_count
-    return _dispatch_cg_and_sync_dp(cudagraph_manager, num_reqs, num_tokens, uniform_token_count, *args, **kwargs)
+    batch_desc, dp_sync = _dispatch_cg_and_sync_dp(
+        cudagraph_manager, num_reqs, num_tokens, uniform_token_count, *args, **kwargs
+    )
+    if has_plan:
+        pcp_manager.validate_decode_dispatch(batch_desc)
+    return batch_desc, dp_sync
 
 
 # Adapted from vLLM ced6857afa GPUModelRunner.initialize_kv_cache.

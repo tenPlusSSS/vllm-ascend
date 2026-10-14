@@ -1380,6 +1380,7 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     def test_pcp_decode_balance_policy_defaults_round_robin(self, mock_fix):
         vc = VllmConfig()
         self.assertEqual(init_ascend_config(vc).pcp_decode_balance_policy, "round_robin")
+        self.assertEqual(init_ascend_config(vc).pcp_decode_balance_token_factor, 1.5)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -1398,6 +1399,25 @@ class TestTopLevelSwitchTypeValidation(TestBase):
                 vc = VllmConfig()
                 vc.additional_config = {"pcp_decode_balance_policy": policy}
                 with self.assertRaisesRegex(ValueError, "pcp_decode_balance_policy"):
+                    init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_pcp_decode_balance_token_factor_accepts_finite_values_at_least_one(self, mock_fix):
+        for factor in (1, 1.0, 1.25, 1.5, 2.0, 1e308):
+            with self.subTest(factor=factor):
+                vc = VllmConfig()
+                vc.additional_config = {"pcp_decode_balance_token_factor": factor}
+                self.assertEqual(init_ascend_config(vc).pcp_decode_balance_token_factor, factor)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_pcp_decode_balance_token_factor_rejects_invalid_values(self, mock_fix):
+        for factor in (0, -1, 0.99, True, False, None, "1.5", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(factor=factor):
+                vc = VllmConfig()
+                vc.additional_config = {"pcp_decode_balance_token_factor": factor}
+                with self.assertRaisesRegex(ValueError, "pcp_decode_balance_token_factor"):
                     init_ascend_config(vc)
 
     @_clean_up

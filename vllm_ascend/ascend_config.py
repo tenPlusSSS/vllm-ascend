@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -434,6 +434,7 @@ class AscendConfig:
             "enable_pcp_o_proj_weight_sharding": false,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
             "pcp_decode_balance_policy": "round_robin",
+            "pcp_decode_balance_token_factor": 1.5,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -575,8 +576,10 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
-    # MRV2 sharded decode ownership; balance query tokens and attention work.
+    # MRV2 sharded decode ownership; balance attention within request/token limits.
     pcp_decode_balance_policy: Literal["round_robin", "load_balance"] = "round_robin"
+    # Candidate token budget = ceil(factor * global scheduled tokens / PCP size).
+    pcp_decode_balance_token_factor: float = Field(default=1.5, ge=1.0, allow_inf_nan=False, strict=True)
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this

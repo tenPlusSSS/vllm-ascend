@@ -11,10 +11,11 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.patch.worker.patch_v2.patch_model_runner import dispatch_cg_and_sync_dp
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -25,6 +26,7 @@ def _make_runner(need_timing: bool = True):
     runner.ascend_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
         pcp_decode_balance_policy="round_robin",
+        pcp_decode_balance_token_factor=1.5,
     )
     runner.vllm_config = SimpleNamespace()
     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
@@ -75,12 +77,12 @@ def _install_pcp_balance(runner):
 def test_decode_plan_precedes_graph_dispatch_and_dp_sync(dp_size):
     runner = _make_runner()
     manager = _install_pcp_balance(runner)
-    state = _make_batch_state([100, 835, 100, 835], [8, 1, 8, 1], [1] * 4)
+    state = _make_batch_state([100, 100, 100, 100], [8, 1, 8, 1], [1] * 4)
     computed = np.zeros(4, dtype=np.int32)
     runner.req_states = SimpleNamespace(num_computed_tokens_np=computed)
 
     def correct_lengths(*args):
-        computed[:] = [100, 835, 100, 835]
+        computed[:] = [100, 100, 100, 100]
 
     with (
         patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(state, None)),
@@ -103,6 +105,7 @@ def test_decode_plan_precedes_graph_dispatch_and_dp_sync(dp_size):
     synced_desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 16, None)
     expected_sync = DPSyncState(torch.full((2,), 16), None, False, 4)
     graph_manager = MagicMock()
+    graph_manager.model_runner = runner
     graph_manager.dispatch.return_value = local_desc
     with patch(
         "vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding",
@@ -110,19 +113,97 @@ def test_decode_plan_precedes_graph_dispatch_and_dp_sync(dp_size):
     ) as sync:
         desc, dp_sync = dispatch_cg_and_sync_dp(graph_manager, 4, num_tokens, uniform, dp_size, 0)
     assert graph_manager.dispatch.call_args.args[1] == 9
+    assert graph_manager.dispatch.call_args.args[0] == 2
     if dp_size == 1:
         sync.assert_not_called()
         assert desc is local_desc and dp_sync is None
     else:
         assert sync.call_args.args[2] == 9
+        assert sync.call_args.args[3] == 2
         assert desc is synced_desc and dp_sync is expected_sync
+
+
+@pytest.mark.parametrize("uniform", [None, 1, 4])
+def test_dispatch_wrapper_uses_request_plan_or_original_uniform_fallback(uniform):
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    if uniform is None:
+        manager.prepare_decode_partition(
+            ["a", "b", "c", "d"], np.array([8, 1, 8, 1]), np.zeros(4, dtype=np.bool_), np.array([200, 100, 100, 200])
+        )
+        tokens, requests = 10, 3
+    else:
+        manager.prepare_decode_partition(
+            ["a", "b", "c"], np.full(3, uniform), np.zeros(3, dtype=np.bool_), np.array([99, 1, 1])
+        )
+        tokens, requests = 2 * uniform, 2
+    graph_manager = MagicMock(model_runner=runner)
+    desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, tokens, requests)
+    graph_manager.dispatch.return_value = desc
+    actual, _ = dispatch_cg_and_sync_dp(graph_manager, 4 if uniform is None else 3, tokens, uniform, 1, 0)
+    assert actual is desc
+    assert graph_manager.dispatch.call_args.args[:2] == (requests, tokens)
+
+    manager.clear_decode_partition_plan()
+    dispatch_cg_and_sync_dp(
+        graph_manager, 4, tokens, uniform, 1, 0, parallel_config=manager.vllm_config.parallel_config
+    )
+    assert graph_manager.dispatch.call_args.args[0] == (4 if uniform is None else tokens // uniform)
+
+
+def test_dispatch_wrapper_checks_descriptor_returned_by_dp_sync():
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    manager.prepare_decode_partition(["a", "b", "c"], np.ones(3), np.zeros(3, dtype=np.bool_), np.array([99, 1, 1]))
+    graph_manager = MagicMock(model_runner=runner)
+    graph_manager.dispatch.return_value = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, 1)
+    undersized = BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 1, 1)
+    with (
+        patch("vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding", return_value=(undersized, None)),
+        pytest.raises(RuntimeError, match="request capacity"),
+    ):
+        dispatch_cg_and_sync_dp(graph_manager, 3, 2, 1, 2, 0)
+    assert manager._decode_partition_plan is None
+
+
+@pytest.mark.parametrize("query_len", [1, 4])
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_average_token_budget_dispatches_larger_uniform_plan(query_len, dp_size, mode):
+    runner = _make_runner()
+    manager = _install_pcp_balance(runner)
+    counts = np.full(4, query_len, dtype=np.int32)
+    prefilling = np.zeros(4, dtype=np.bool_)
+    manager._input_buffers = SimpleNamespace(max_num_reqs=8, max_num_tokens=4 * query_len)
+    manager.global_input_buffers = SimpleNamespace(max_num_reqs=4, max_num_tokens=4 * query_len)
+    assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 2 * query_len
+    manager.prepare_decode_partition(["a", "b", "c", "d"], counts, prefilling, np.array([899, 399, 99, 399]))
+    tokens = manager.get_num_tokens_for_dispatch(counts, prefilling)
+    assert tokens == 3 * query_len
+    assert manager._decode_partition_plan.per_rank_num_decode_reqs == (1, 3)
+    # Dispatch can select a larger captured FULL bucket, or return eager when
+    # none matches. Both paths must receive the larger planned dimensions.
+    graph_rows = 4 if mode == CUDAGraphMode.FULL else 3
+    desc = BatchExecutionDescriptor(
+        mode, graph_rows * query_len, graph_rows, query_len if mode == CUDAGraphMode.FULL else None
+    )
+    graph_manager = MagicMock(model_runner=runner)
+    graph_manager.dispatch.return_value = desc
+    with patch("vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding", return_value=(desc, None)) as sync:
+        actual, _ = dispatch_cg_and_sync_dp(graph_manager, 4, tokens, query_len, dp_size, 0)
+    assert graph_manager.dispatch.call_args.args[:3] == (3, tokens, query_len)
+    if dp_size == 2:
+        assert sync.call_args.args[2:5] == (tokens, 3, query_len)
+    else:
+        sync.assert_not_called()
+    assert actual is desc
 
 
 @pytest.mark.parametrize("case", ["round_robin", "replicated", "dummy", "adaptive"])
 def test_gather_skips_decode_planning_when_unavailable(case):
     runner = _make_runner()
     manager = _install_pcp_balance(runner)
-    state = _make_batch_state([100, 835, 100, 835], [8, 1, 8, 1], [1] * 4)
+    state = _make_batch_state([100, 100, 100, 100], [8, 1, 8, 1], [1] * 4)
     scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"req-0": [1]})
     if case == "round_robin":
         manager.decode_balance_policy = "round_robin"
@@ -728,9 +809,11 @@ def test_sample_tokens_spec_pp_broadcasts_draft_tokens():
 
 
 @pytest.mark.parametrize("decode_balance_policy", ["round_robin", "load_balance"])
-def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(decode_balance_policy):
+@pytest.mark.parametrize("token_factor", [1.0, 1.5, 2.0])
+def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(decode_balance_policy, token_factor):
     runner = _make_runner()
     runner.ascend_config.pcp_decode_balance_policy = decode_balance_policy
+    runner.ascend_config.pcp_decode_balance_token_factor = token_factor
     runner.input_buffers = object()
     runner.vllm_config = SimpleNamespace()
     runner.compilation_config = SimpleNamespace(static_forward_context={})
@@ -773,6 +856,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(decode_balance_po
     assert runner.model_state.kvpp_runtime == "kvpp"
     assert runner.pcp_manager.vllm_config is runner.vllm_config
     assert runner.pcp_manager.decode_balance_policy == decode_balance_policy
+    assert runner.pcp_manager.decode_balance_token_factor == token_factor
     assert runner.model_state.pcp_manager is runner.pcp_manager
     assert runner.speculator.pcp_manager is runner.pcp_manager
     runner.init_routed_experts_capturer.assert_called_once_with()
@@ -927,6 +1011,10 @@ def _run_prepare_inputs(
 ):
     batch = SimpleNamespace(positions=torch.zeros(4, dtype=torch.int32))
 
+    def _make_batch(**kwargs):
+        batch.input_kwargs = kwargs
+        return batch
+
     def _partition(_pcp_manager, input_batch, **_kwargs):
         return input_batch
 
@@ -945,7 +1033,7 @@ def _run_prepare_inputs(
             "vllm_ascend.worker.v2.model_runner.expand_idx_mapping",
             return_value=(torch.tensor([0, 1], dtype=torch.int32), torch.zeros(2, dtype=torch.int32)),
         ),
-        patch("vllm_ascend.worker.v2.model_runner.AscendInputBatch", return_value=batch),
+        patch("vllm_ascend.worker.v2.model_runner.AscendInputBatch", side_effect=_make_batch),
         patch.object(
             vllm_model_runner,
             "pcp",
@@ -984,6 +1072,17 @@ def test_prepare_inputs_common_path():
     assert out is partitioned
     runner.eplb.set_batch_phase.assert_called_once_with(True)
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_cpu[:2], np.array([3, 4], dtype=np.int32))
+
+
+def test_eager_pcp_local_rows_do_not_pad_global_request_metadata():
+    runner, scheduler, state, desc = _prepare_inputs_runner()
+    _install_pcp_balance(runner)
+    # The global buffers have four request rows. Splitting prefills can require
+    # more local rows, but this eager descriptor must not resize global metadata.
+    desc.num_reqs = 5
+    out, _ = _run_prepare_inputs(runner, scheduler, state, desc)
+    assert out.input_kwargs["num_reqs"] == 2
+    assert out.input_kwargs["num_reqs_after_padding"] == 2
 
 
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 5])
