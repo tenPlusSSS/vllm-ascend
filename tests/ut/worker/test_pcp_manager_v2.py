@@ -1783,3 +1783,44 @@ def test_relaxed_uniform_plan_rejects_old_round_robin_graph():
     with pytest.raises(RuntimeError, match="token capacity"):
         manager.validate_decode_dispatch(BatchExecutionDescriptor(CUDAGraphMode.FULL, 2, 2, 1))
     assert manager._decode_partition_plan is None
+
+
+def test_decode_balance_observability_counts_adoption_and_fallbacks():
+    manager = _make_decode_plan_manager()
+    manager._BALANCE_LOG_INTERVAL = 3
+    batch = _make_decode_plan_batch()
+    owners = manager._balance_decode_owners(
+        batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+    )
+    # Adopted: balanced attention 937/937 beats round-robin's 1672/202.
+    np.testing.assert_array_equal(owners, [0, 0, 1, 1])
+    single = SimpleNamespace(
+        num_scheduled_tokens=np.array([1, 0], dtype=np.int32),
+        num_computed_tokens_np=np.array([10, 0], dtype=np.int64),
+        is_prefilling_np=np.zeros(2, dtype=np.bool_),
+    )
+    manager._balance_decode_owners(single.num_scheduled_tokens, single.is_prefilling_np, single.num_computed_tokens_np)
+    stats = manager._decode_balance_stats
+    assert stats["steps"] == 2
+    assert stats["adopted"] == 1
+    assert stats["fallbacks"] == {"single_decode_request": 1}
+    # Only the adopted step sampled the imbalance ratio: 1672/937 -> 1.0.
+    # Early fallbacks leave the attention model unevaluated and add no sample.
+    assert stats["ratio_steps"] == 1
+    assert abs(stats["baseline_ratio_sum"] - 1672 / 937) < 1e-9
+    assert stats["planned_ratio_sum"] == 1.0
+
+    with patch("vllm_ascend.worker.v2.pcp_manager.logger") as log:
+        manager._balance_decode_owners(
+            batch.num_scheduled_tokens, batch.is_prefilling_np, batch.num_computed_tokens_np
+        )
+        log.info.assert_called_once()
+        args = log.info.call_args.args
+        assert args[1] == manager.pcp_rank
+        assert args[2] == 3  # window size
+        assert args[3] == 2  # adopted steps
+        assert args[5] == {"single_decode_request": 1}
+        assert abs(args[6] - 1672 / 937) < 1e-9  # averaged over the two adopted samples
+        assert args[7] == 1.0
+    # The summary log closes the window; the next planned step opens a fresh one.
+    assert manager._decode_balance_stats is None

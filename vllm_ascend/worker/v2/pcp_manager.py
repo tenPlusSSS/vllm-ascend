@@ -20,12 +20,13 @@
 import math
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pcp_group, get_pp_group
+from vllm.logger import logger
 
 # vLLM main (#56888) replaced buffer_utils.async_copy_to_gpu with
 # torch_utils.async_tensor_h2d (gaining out=/device=None support).
@@ -88,6 +89,13 @@ class AscendPCPManager(PCPManager):
     # Set from the validated Ascend config when the runner initializes PCP.
     decode_balance_policy: Literal["round_robin", "load_balance"] = "round_robin"
     decode_balance_token_factor: float = 1.5
+    # Decode-balance observability: one summary log per _BALANCE_LOG_INTERVAL
+    # planned steps. Counters are created lazily on the instance; None = new
+    # window. Steps that skip planning entirely (policy off, adaptive
+    # verification, dummy runs) never reach the recorder, so a silent log is
+    # itself the signal that planning did not run.
+    _BALANCE_LOG_INTERVAL = 100
+    _decode_balance_stats: dict[str, Any] | None = None
     _decode_partition_plan: PCPDecodePartitionPlan | None = None
     # Only installed while traversing a plan's chunks; dispatch reads the plan.
     _decode_owner_ranks: np.ndarray | None = None
@@ -329,6 +337,60 @@ class AscendPCPManager(PCPManager):
                     self.clear_decode_partition_plan()
                     raise RuntimeError("PCP FULL graph global request capacity is smaller than the decode plan.")
 
+    def _record_decode_balance_step(
+        self,
+        adopted: bool,
+        fallback_reason: str,
+        baseline_work: list[int] | None,
+        planned_work: list[int] | None,
+    ) -> None:
+        """Track decode-balance adoption and attention imbalance per window.
+
+        baseline_work / planned_work are round-robin's and the chosen layout's
+        per-rank attention work; the max/mean ratio approximates the compute
+        skew that balancing can recover. Early fallbacks pass None because the
+        attention model has not been evaluated yet (or cannot be improved).
+        """
+        stats = self._decode_balance_stats
+        if stats is None:
+            stats = self._decode_balance_stats = {
+                "steps": 0,
+                "adopted": 0,
+                "fallbacks": {},
+                "ratio_steps": 0,
+                "baseline_ratio_sum": 0.0,
+                "planned_ratio_sum": 0.0,
+            }
+        stats["steps"] += 1
+        if adopted:
+            stats["adopted"] += 1
+        else:
+            fallbacks: dict[str, int] = stats["fallbacks"]
+            fallbacks[fallback_reason] = fallbacks.get(fallback_reason, 0) + 1
+        if baseline_work is not None and planned_work is not None and sum(baseline_work) > 0:
+            mean_work = sum(baseline_work) / len(baseline_work)
+            stats["ratio_steps"] += 1
+            stats["baseline_ratio_sum"] += max(baseline_work) / mean_work
+            stats["planned_ratio_sum"] += max(planned_work) / mean_work
+        if stats["steps"] < self._BALANCE_LOG_INTERVAL:
+            return
+        ratio_steps = stats["ratio_steps"]
+        baseline_ratio = stats["baseline_ratio_sum"] / ratio_steps if ratio_steps else 0.0
+        planned_ratio = stats["planned_ratio_sum"] / ratio_steps if ratio_steps else 0.0
+        logger.info(
+            "PCP decode balance rank %d (last %d steps): adopted %d (%.1f%%), "
+            "fallbacks %s, attention imbalance max/mean %.2f -> %.2f",
+            self.pcp_rank,
+            stats["steps"],
+            stats["adopted"],
+            100.0 * stats["adopted"] / stats["steps"],
+            stats["fallbacks"],
+            baseline_ratio,
+            planned_ratio,
+        )
+        # Reset the window; the next planned step opens a fresh one.
+        self._decode_balance_stats = None
+
     def _balance_decode_owners(self, counts: np.ndarray, prefilling: np.ndarray, computed: np.ndarray) -> np.ndarray:
         """Balance decode attention work under request and token constraints.
 
@@ -343,7 +405,11 @@ class AscendPCPManager(PCPManager):
         decode_indices = np.flatnonzero((counts > 0) & ~prefilling)
         round_robin = np.full(len(counts), -1, dtype=np.int32)
         round_robin[decode_indices] = np.arange(len(decode_indices)) % self.pcp_world_size
-        if len(decode_indices) <= 1 or self.pcp_world_size == 1:
+        if len(decode_indices) <= 1:
+            self._record_decode_balance_step(False, "single_decode_request", None, None)
+            return round_robin
+        if self.pcp_world_size == 1:
+            self._record_decode_balance_step(False, "single_pcp_rank", None, None)
             return round_robin
         if (
             self.vllm_config.parallel_config.pipeline_parallel_size > 1
@@ -352,6 +418,7 @@ class AscendPCPManager(PCPManager):
             # Non-last PP stages do not universally correct CPU counts after
             # draft rejection. Different lengths could produce different owner
             # layouts for the hidden states sent between pipeline stages.
+            self._record_decode_balance_step(False, "pipeline_speculative", None, None)
             return round_robin
 
         # Prefill only reserves dispatch space. Tail chunks may have different
@@ -370,6 +437,7 @@ class AscendPCPManager(PCPManager):
         # Fixed prefill chunks can already exceed the average-based budget on
         # a rank that receives no decodes. Check them before placing requests.
         if any(tokens > token_capacity for tokens in prefill_tokens):
+            self._record_decode_balance_step(False, "prefill_over_budget", None, None)
             return round_robin
         attention_work: dict[int, int] = {}
         baseline_attention_work = [0] * self.pcp_world_size
@@ -405,6 +473,9 @@ class AscendPCPManager(PCPManager):
                 # Whole requests may not fit this budget, even if each one
                 # fits individually. Dispatch will size the fallback layout;
                 # only physical capacities remain hard limits in that case.
+                self._record_decode_balance_step(
+                    False, "greedy_infeasible", baseline_attention_work, baseline_attention_work
+                )
                 return round_robin
             owners[req_idx] = owner
             rank_decode_reqs[owner] += 1
@@ -413,7 +484,14 @@ class AscendPCPManager(PCPManager):
 
         # Capacity-constrained greedy assignment is a heuristic. Keep the
         # existing order unless the maximum decode attention work decreases.
-        return owners if max(rank_attention_work) < max(baseline_attention_work) else round_robin
+        adopted = max(rank_attention_work) < max(baseline_attention_work)
+        self._record_decode_balance_step(
+            adopted,
+            "no_attention_improvement",
+            baseline_attention_work,
+            rank_attention_work if adopted else baseline_attention_work,
+        )
+        return owners if adopted else round_robin
 
     def _iter_rank_chunks(
         self,
