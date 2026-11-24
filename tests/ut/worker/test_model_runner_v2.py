@@ -36,6 +36,7 @@ from vllm_ascend.worker.v2.utils import C8KVBlockZeroer
 def _make_runner(need_timing: bool = True):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.ascend_config = SimpleNamespace(
+        use_pcp_indexer_sharding=Mock(return_value=False),
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
         sparse_kv_offload_config=SimpleNamespace(enabled=False),
         kvpp_config=SimpleNamespace(size=1),

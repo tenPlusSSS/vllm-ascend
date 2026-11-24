@@ -109,7 +109,8 @@ def test_sfa_indexer_backend_contract():
 
 
 @pytest.mark.parametrize("enabled,spec_tokens,expected", [(False, None, False), (True, None, True), (True, 2, False)])
-def test_pcp_indexer_builder_only_selects_non_speculative_target(monkeypatch, enabled, spec_tokens, expected):
+@pytest.mark.parametrize("capture", [False, True])
+def test_pcp_indexer_builder_only_selects_non_speculative_target(monkeypatch, enabled, spec_tokens, expected, capture):
     builder = _make_builder(pcp_size=2, num_speculative_tokens=spec_tokens, pcp_indexer_sharding=enabled)
     common = _make_common_metadata()
     common.pcp_context = _make_decode_pcp_context()
@@ -121,7 +122,7 @@ def test_pcp_indexer_builder_only_selects_non_speculative_target(monkeypatch, en
         "vllm_ascend.attention.indexer.get_cos_and_sin_mla",
         lambda *args, **kwargs: (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8)),
     )
-    metadata = builder.build(0, common)
+    metadata = builder.build_for_cudagraph_capture(common) if capture else builder.build(0, common)
     assert metadata.pcp_indexer is (selected if expected else None)
     assert select.call_count == int(expected)
 
@@ -204,8 +205,7 @@ def test_pcp_indexer_forward_updates_only_owner_after_cache_write(monkeypatch, l
         actual_seq_lengths_query=torch.tensor([1, 2]),
         actual_seq_lengths_key=torch.tensor([128, 256]),
         pcp_indexer=SimpleNamespace(
-            query_row=torch.tensor([local_row]),
-            batch=SimpleNamespace(block_table=batch_table, query_lens=query_lens, key_lens=shard_lens),
+            metadata=SimpleNamespace(block_table=batch_table, query_lens=query_lens, key_lens=shard_lens),
         ),
     )
     hidden = torch.ones(2, 8)
@@ -224,7 +224,7 @@ def test_pcp_indexer_forward_updates_only_owner_after_cache_write(monkeypatch, l
     assert events == ["gather_k", "write_k", "copy_q", "native_indexer", "merge"]
     assert native.call_count == 1
     assert native.call_args.args[0].shape[0] == actual_tokens + 1
-    assert native.call_args.args[5] is metadata.pcp_indexer
+    assert native.call_args.args[5] is metadata.pcp_indexer.metadata
     assert native.call_args.args[6] == 4
     assert metadata.actual_seq_lengths_key.tolist() == [128, 256]
     expected = ordinary.clone() if actual_tokens else torch.full_like(ordinary, -1)

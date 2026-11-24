@@ -9,13 +9,55 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 
+from vllm_ascend.worker.v2.aclgraph_utils import MixedIndexerDescriptor, ModelAclGraphManager, PCPIndexerAclGraphManager
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.aclgraph import (
     AutoRegressiveAclGraphManager,
 )
+
+
+@pytest.mark.parametrize("profile_limit", [None, 1, 2])
+def test_pcp_indexer_capture_both_shapes_and_replay_current_plan(monkeypatch, profile_limit):
+    full = CUDAGraphMode.FULL
+    normal = [BatchExecutionDescriptor(full, size, size, 1) for size in (8, 2)]
+    pcp = SimpleNamespace(capture_mixed_indexer=False)
+    state = SimpleNamespace(pcp_context=SimpleNamespace(indexer_plan=None))
+    captures = {}
+
+    def init(manager):
+        manager._capture_descs = {full: normal}
+        manager._candidates = {(d.num_tokens, 0): [d] for d in normal}
+        manager._max_full_descs_to_capture = profile_limit
+        manager.model_runner = SimpleNamespace(model_state=state)
+
+    def capture(*, progress_bar_desc):
+        for desc in manager._capture_descs[full]:
+            assert desc not in captures
+            assert isinstance(desc, MixedIndexerDescriptor) == pcp.capture_mixed_indexer
+            captures[desc] = object()
+
+    monkeypatch.setattr(ModelAclGraphManager, "__init__", init)
+    monkeypatch.setattr(ModelAclGraphManager, "run_fullgraph", lambda self, desc: captures[desc])
+    manager = PCPIndexerAclGraphManager()
+    variants = [d for desc in normal for d in (manager.mixed_descriptors[desc], desc)]
+    assert manager._capture_descs[full] == variants
+    assert len(set(variants)) == 4
+    manager._capture_variants(capture, pcp, "test capture")
+    assert set(captures) == set(variants[:profile_limit])
+    assert isinstance(next(iter(captures)), MixedIndexerDescriptor)
+    assert manager._capture_descs[full] == variants
+    assert not pcp.capture_mixed_indexer
+    if profile_limit is None:
+        for desc in normal:
+            assert manager._candidates[desc.num_tokens, 0] == [desc]
+            for requests in ((), (2,), (0, 3), ()):
+                state.pcp_context.indexer_plan = SimpleNamespace(requests=requests) if requests else None
+                expected = manager.mixed_descriptors[desc] if requests else desc
+                assert manager.run_fullgraph(desc) is captures[expected]
 
 
 def _parent_init(

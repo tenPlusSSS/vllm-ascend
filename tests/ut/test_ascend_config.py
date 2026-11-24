@@ -1844,6 +1844,10 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     def test_pcp_indexer_rejects_incompatible_parallel_and_graph_modes(self):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             AscendConfig._validate_user_input_ranges(SimpleNamespace(pcp_indexer_sharding_min_seq_len=-1))
+        with self.assertRaisesRegex(ValueError, "max_requests"):
+            AscendConfig._validate_user_input_ranges(
+                SimpleNamespace(pcp_indexer_sharding_min_seq_len=0, pcp_indexer_sharding_max_requests=-1)
+            )
         config = SimpleNamespace(
             enable_pcp_indexer_sharding=True,
             sparse_kv_offload_config=SimpleNamespace(enabled=False),
@@ -1851,7 +1855,8 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         for pcp, dcp, mode, error in (
             (1, 1, CUDAGraphMode.NONE, "PCP > 1"),
             (2, 2, CUDAGraphMode.NONE, "DCP = 1"),
-            (2, 1, CUDAGraphMode.FULL_DECODE_ONLY, "full graphs"),
+            (2, 1, CUDAGraphMode.FULL, "FULL_DECODE_ONLY"),
+            (2, 1, CUDAGraphMode.FULL_AND_PIECEWISE, "FULL_DECODE_ONLY"),
         ):
             with self.subTest(pcp=pcp, dcp=dcp, mode=mode):
                 vc = SimpleNamespace(

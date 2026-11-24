@@ -1,148 +1,186 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cooperative indexing of one decode query without changing PCP ownership."""
+"""Request-selective indexing over contiguous logical K blocks on replicated PCP caches."""
 
-from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from functools import cached_property
 
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
 
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 
 
-@dataclass
-class PCPIndexerBatchMetadata:
-    """One native indexer batch containing local queries and the shared shard."""
+@dataclass(frozen=True)
+class PCPIndexerPlan:
+    """Global scheduled batch rows, in slot order, for one model step."""
 
-    block_table: torch.Tensor
-    query_lens: torch.Tensor
-    query_start_loc: torch.Tensor
-    key_lens: torch.Tensor
-    shared_row: torch.Tensor
-    shard_seq_len: torch.Tensor
-    num_local_tokens: int
-    # The producer depends on batch boundaries and shape, not layer Q/K values.
-    native_metadata: dict[tuple[int, int, int], torch.Tensor] = field(default_factory=dict)
+    requests: tuple[int, ...]
+    slots: int
+    full_graph: bool
+
+
+def plan_pcp_indexer_step(batch, minimum: int, capacity: int, *, full_graph: bool) -> PCPIndexerPlan | None:
+    """Use only shared CPU batch state. A configured cap prioritizes the longest eligible requests."""
+    n = batch.num_reqs
+    lengths = batch.num_computed_tokens_np[:n] + 1
+    eligible = np.flatnonzero(
+        (batch.num_scheduled_tokens[:n] == 1) & ~batch.is_prefilling_np[:n] & (lengths >= minimum)
+    )
+    if not eligible.size or capacity <= 0:
+        return None
+    if eligible.size > capacity:
+        order = np.argsort(-lengths[eligible].astype(np.int64), kind="stable")
+        eligible = np.sort(eligible[order[:capacity]])
+    requests = tuple(eligible.tolist())
+    return PCPIndexerPlan(requests, capacity if full_graph else len(requests), full_graph)
 
 
 @dataclass
 class PCPIndexerMetadata:
-    # -1 on helper ranks; otherwise the query's row in the owner's local batch.
-    query_row: torch.Tensor
+    query_start_loc: torch.Tensor
+    key_lens: torch.Tensor
     block_table: torch.Tensor
-    seq_len: torch.Tensor
-    key_start: int
-    key_count: int
-    batch: PCPIndexerBatchMetadata | None = None
+    query_row: torch.Tensor  # Owner's local Q row, or -1 on a helper/unused slot.
+    packet_row: torch.Tensor  # Rank-major row of this slot's Q after all-gather.
+    query_source: torch.Tensor  # TND row -> row in [padded local Q | shared Q].
+    shared_row: torch.Tensor  # Slot -> native QLI row that produced this rank's candidates.
+    key_start: torch.Tensor
+    shard_seq_len: torch.Tensor
+    output_source: torch.Tensor  # Local model row -> row in [local results | merged results | padding].
+    native_metadata: dict[tuple[int, int, int], torch.Tensor] = field(default_factory=dict)
 
 
-def select_longest_decode(
-    scheduled: Sequence[int],
-    computed: Sequence[int],
-    is_prefilling: Sequence[bool],
-    min_seq_len: int,
-) -> int | None:
-    """Choose a single-token decode, breaking length ties by global batch order."""
-    candidates = (
-        i for i, count in enumerate(scheduled) if count == 1 and not is_prefilling[i] and computed[i] + 1 >= min_seq_len
-    )
-    return max(candidates, key=lambda i: (computed[i], -i), default=None)
+@dataclass
+class PCPIndexerInputs:
+    """Stable inputs to the mixed graph. The QLI layout is computed inside the model forward."""
 
+    selection: torch.Tensor  # Global request/token rows, followed by slot count and local token count.
+    restored: torch.Tensor
+    lengths: torch.Tensor
+    selected_table: torch.Tensor
+    local_offsets: torch.Tensor
+    local_lengths: torch.Tensor
+    local_table: torch.Tensor
+    tokens: int
+    block_size: int
 
-def partition_indexer_keys(seq_len: int, block_size: int, rank: int, world_size: int) -> tuple[int, int]:
-    """Partition logical blocks, including the partially filled last block."""
-    blocks = (seq_len + block_size - 1) // block_size
-    start = blocks * rank // world_size * block_size
-    end = blocks * (rank + 1) // world_size * block_size
-    return start, end - start
+    @cached_property
+    def metadata(self) -> PCPIndexerMetadata:
+        return _build_native_layout(self)
 
 
 def build_pcp_indexer_metadata(
-    common: Any,
-    context: Any,
-    cache_group: int,
-    block_size: int,
-    min_seq_len: int,
-) -> PCPIndexerMetadata | None:
+    common, context, cache_group: int, block_size: int, graph_buffers: dict
+) -> PCPIndexerInputs | None:
+    plan = context.indexer_plan
+    if plan is None:
+        return None
+
+    slots = plan.slots
     batch = context.global_batch
-    if batch.is_dummy:
-        return None
-    count = batch.num_reqs
-    request = select_longest_decode(
-        batch.num_scheduled_tokens[:count],
-        batch.num_computed_tokens_np[:count],
-        batch.is_prefilling_np[:count],
-        min_seq_len,
-    )
-    if request is None:
-        return None
+    count = len(plan.requests)
+    # New host storage for each nonblocking transfer, including back-to-back steps.
+    selection = np.zeros((2, slots + 1), dtype=np.int64)
+    selection[0, :count] = plan.requests
+    selection[1, :count] = batch.query_start_loc_np[selection[0, :count]]
+    selection[:, -1] = (count, common.num_actual_tokens)
 
+    n, tokens = common.num_reqs, common.num_input_tokens
+    local_table = common.block_table_tensor[:n]
+    global_table = context.global_block_tables[cache_group]
+    key = (cache_group, tokens, n, slots)
+    buffers = graph_buffers.get(key) if plan.full_graph else None
+    if buffers is None:
+        buffers = PCPIndexerInputs(
+            selection=torch.empty(selection.shape, dtype=torch.long, device=common.seq_lens.device),
+            restored=context.hidden_restore_idx.new_empty((slots,)),
+            lengths=batch.seq_lens.new_empty((slots,)),
+            selected_table=global_table.new_empty((slots, global_table.shape[1])),
+            local_offsets=torch.empty_like(common.query_start_loc[: n + 1]),
+            local_lengths=torch.empty_like(common.seq_lens[:n]),
+            local_table=torch.empty_like(local_table),
+            tokens=tokens,
+            block_size=block_size,
+        )
+        if plan.full_graph:
+            graph_buffers[key] = buffers
+    elif buffers.selected_table.shape[1] != global_table.shape[1] or buffers.local_table.shape != local_table.shape:
+        raise RuntimeError("PCP indexer block-table shape changed within a captured bucket")
+    buffers.selection.copy_(torch.from_numpy(selection), non_blocking=True)
+    request_rows, token_rows = buffers.selection[:, :slots].unbind()
+    torch.index_select(context.hidden_restore_idx, 0, token_rows, out=buffers.restored)
+    torch.index_select(batch.seq_lens, 0, request_rows, out=buffers.lengths)
+    torch.index_select(global_table, 0, request_rows, out=buffers.selected_table)
+    buffers.local_offsets.copy_(common.query_start_loc[: n + 1])
+    buffers.local_lengths.copy_(common.seq_lens[:n])
+    buffers.local_table.copy_(local_table)
+    # Share captured addresses, but create fresh per-forward caches. This records
+    # both layout and QLI metadata producers during capture, even after warmup.
+    return replace(buffers)
+
+
+def _build_native_layout(inputs: PCPIndexerInputs) -> PCPIndexerMetadata:
     group = get_pcp_group()
-    global_token = int(batch.query_start_loc_np[request])
-    # Use the manager's actual restore mapping, rather than duplicating its
-    # ownership/reordering policy. No device-to-host scalar read is needed.
-    gathered_row = context.hidden_restore_idx[global_token : global_token + 1]
-    local_start = group.rank_in_group * common.num_input_tokens
-    local_row = gathered_row - local_start
-    owns_query = (local_row >= 0) & (local_row < common.num_actual_tokens)
-    local_row = torch.where(owns_query, local_row, -1)
-    seq_len = int(batch.num_computed_tokens_np[request]) + 1
-    key_start, key_count = partition_indexer_keys(seq_len, block_size, group.rank_in_group, group.world_size)
-    block_count = (seq_len + block_size - 1) // block_size
-    metadata = PCPIndexerMetadata(
-        query_row=local_row,
-        block_table=context.global_block_tables[cache_group][request : request + 1, :block_count],
-        seq_len=batch.seq_lens[request : request + 1],
-        key_start=key_start,
-        key_count=key_count,
+    device = inputs.selection.device
+    slot_count = inputs.restored.numel()
+    slots = torch.arange(slot_count, dtype=torch.long, device=device)
+    count, actual = inputs.selection[:, -1].unbind()
+    active = slots < count
+    restored = inputs.restored.long()
+    tokens, block_size = inputs.tokens, inputs.block_size
+    owner_rank = restored // max(tokens, 1)
+    local_row = restored - group.rank_in_group * tokens
+    owns = active & (owner_rank == group.rank_in_group) & (local_row >= 0) & (local_row < actual)
+    query_row = torch.where(owns, local_row, -1)
+
+    lengths = torch.where(active, inputs.lengths, 0)
+    blocks = (lengths + block_size - 1) // block_size
+    first = blocks * group.rank_in_group // group.world_size
+    end = blocks * (group.rank_in_group + 1) // group.world_size
+    key_start = first * block_size
+    shard_len = (torch.minimum(lengths, end * block_size) - key_start).clamp_min(0)
+    local_table = inputs.local_table
+    full_table = inputs.selected_table
+    columns = first[:, None] + torch.arange(local_table.shape[1], device=device)
+    shard_table = torch.where(
+        columns < end[:, None], full_table.gather(1, columns.clamp(max=full_table.shape[1] - 1)), 0
     )
-    metadata.batch = build_pcp_indexer_batch_metadata(common, metadata, block_size)
-    return metadata
+    # Native QLI can require a placeholder key even when this rank owns no visible blocks.
+    native_len = shard_len.clamp_min(1)
+    ends = torch.minimum(inputs.local_offsets[1:], actual.to(inputs.local_offsets.dtype))
+    starts = inputs.local_offsets[:-1]
+    owner_request = owns[:, None] & (starts <= query_row[:, None]) & (query_row[:, None] < ends)
+    req_slot = torch.where(owner_request, slots[:, None], -1).amax(dim=0)
+    safe_slot = req_slot.clamp_min(0)
+    local_table = torch.where(req_slot[:, None] >= 0, shard_table.index_select(0, safe_slot), local_table)
+    local_lengths = torch.where(req_slot >= 0, native_len.index_select(0, safe_slot), inputs.local_lengths)
 
-
-def build_pcp_indexer_batch_metadata(
-    common: Any, metadata: PCPIndexerMetadata, block_size: int
-) -> PCPIndexerBatchMetadata:
-    """Rebase only the selected decode's K view, preserving local causal rows.
-
-    The owner uses its existing query row. Helpers append one query. An extra
-    storage row on the owner has zero query length, so A is never indexed twice.
-    All ownership decisions stay on device, including empty/padded local ranks.
-    """
-    count = common.num_reqs
-    local_tokens = common.num_actual_tokens
-    query_lens = common.query_start_loc[1 : count + 1].clamp(max=local_tokens)
-    starts = common.query_start_loc[:count]
-    owner = metadata.query_row >= 0
-    selected = owner & (starts <= metadata.query_row) & (metadata.query_row < query_lens)
-
-    block_start = metadata.key_start // block_size
-    block_count = metadata.key_count // block_size
-    shard_table = metadata.block_table[:, block_start : block_start + block_count]
-    local_table = common.block_table_tensor[:count]
-    width = max(local_table.shape[1], shard_table.shape[1], 1)
-    shard_table = torch.nn.functional.pad(shard_table, (0, width - shard_table.shape[1]))
-    local_table = torch.nn.functional.pad(local_table, (0, width - local_table.shape[1]))
-    block_table = torch.cat((torch.where(selected[:, None], shard_table, local_table), shard_table), dim=0)
-
-    shard_len = (metadata.seq_len - metadata.key_start).clamp(min=0, max=metadata.key_count)
-    # Some CANN kernels reject zero K length. Empty shards scan one placeholder
-    # key; the real zero length is retained to invalidate all their candidates.
-    native_shard_len = shard_len.clamp(min=1)
-    key_lens = torch.cat((torch.where(selected, native_shard_len, common.seq_lens[:count]), native_shard_len))
-    appended_end = torch.full_like(metadata.query_row, local_tokens) + (~owner).to(metadata.query_row.dtype)
-    query_lens = torch.cat((query_lens, appended_end.to(query_lens.dtype)))
-    shared_row = torch.where(owner, metadata.query_row, local_tokens)
-    return PCPIndexerBatchMetadata(
-        block_table=block_table,
-        query_lens=query_lens,
-        query_start_loc=torch.nn.functional.pad(query_lens, (1, 0)),
-        key_lens=key_lens,
+    # Keep helpers adjacent to *actual* local tokens. Model-input padding lives at the
+    # end of the native TND storage, even when the owner's extra request has zero Q length.
+    helper = active & ~owns
+    helper_ends = actual + helper.cumsum(0)
+    shared_row = torch.where(owns, query_row, torch.where(helper, helper_ends - 1, 0))
+    rows = torch.arange(tokens + slot_count, device=device)
+    helper_slot = torch.searchsorted(helper_ends, rows, right=True).clamp(max=slot_count - 1)
+    query_source = torch.where(rows < actual, rows, tokens + helper_slot)
+    local_rows = rows[:tokens]
+    out_slot = torch.where(owns[:, None] & (query_row[:, None] == local_rows), slots[:, None], -1).amax(dim=0)
+    output_source = torch.where(out_slot >= 0, tokens + out_slot, local_rows)
+    output_source = torch.where(local_rows < actual, output_source, tokens + slot_count)
+    query_ends = torch.cat((ends, helper_ends.to(ends.dtype)))
+    return PCPIndexerMetadata(
+        query_start_loc=torch.nn.functional.pad(query_ends, (1, 0)),
+        key_lens=torch.cat((local_lengths, native_len)),
+        block_table=torch.cat((local_table, shard_table)),
+        query_row=query_row,
+        packet_row=owner_rank * slot_count + slots,
+        query_source=query_source,
         shared_row=shared_row,
+        key_start=key_start,
         shard_seq_len=shard_len,
-        num_local_tokens=local_tokens,
+        output_source=output_source,
     )
 
 
@@ -173,23 +211,21 @@ def select_pcp_indexer_candidates(
     """One PR #20878 QLI V2 call returns both local indices and FP32 scores.
 
     PA_BBND is V2's spelling for the existing [blocks, block_size, N, D]
-    cache. PCP partitions only A's table/length; operator DCP stays disabled.
+    cache. PCP partitions each selected request's table and length.
     Preserve the native score scale (arch22 uses QK / 1024) on every rank.
     """
-    assert metadata.batch is not None
-    batch = metadata.batch
     heads, dim = query.shape[1:]
     shape_key = (heads, dim, topk)
-    if shape_key not in batch.native_metadata:
-        batch.native_metadata[shape_key] = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+    if shape_key not in metadata.native_metadata:
+        metadata.native_metadata[shape_key] = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
             heads,
             1,
             dim,
             topk,
             2,  # V2 QUANT_MODE_INT8 (the old torch_npu API used 0).
-            cu_seqlens_q=batch.query_start_loc,
-            seqused_k=batch.key_lens,
-            batch_size=batch.key_lens.shape[0],
+            cu_seqlens_q=metadata.query_start_loc,
+            seqused_k=metadata.key_lens,
+            batch_size=metadata.key_lens.shape[0],
             max_seqlen_q=-1,
             max_seqlen_k=-1,
             layout_q="TND",
@@ -205,10 +241,10 @@ def select_pcp_indexer_candidates(
         key_scale.reshape(key_cache.shape[:2] + (1,)),
         topk,
         2,
-        cu_seqlens_q=batch.query_start_loc,
-        seqused_k=batch.key_lens,
-        block_table=batch.block_table,
-        metadata=batch.native_metadata[shape_key],
+        cu_seqlens_q=metadata.query_start_loc,
+        seqused_k=metadata.key_lens,
+        block_table=metadata.block_table,
+        metadata=metadata.native_metadata[shape_key],
         layout_q="TND",
         layout_k="PA_BBND",
         mask_mode=3,
@@ -218,105 +254,69 @@ def select_pcp_indexer_candidates(
     )
 
 
-def replicate_indexer_query(
-    query: torch.Tensor,
-    weights: torch.Tensor,
-    query_scale: torch.Tensor | None,
-    query_row: torch.Tensor,
-    group: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Replicate the owner's projected query in one collective, including empty ranks."""
-    heads, dim = query.shape[1:]
-    query_size = heads * dim
-    scale_size = heads if query_scale is not None else 0
-    payload = torch.zeros(query_size + heads + scale_size, dtype=torch.float32, device=query.device)
-    if query.shape[0]:
-        row = query_row.clamp(min=0)
-        owned = query_row >= 0
-        payload[:query_size] = torch.where(owned, query.index_select(0, row).flatten().float(), 0)
-        payload[query_size : query_size + heads] = torch.where(owned, weights.index_select(0, row).flatten().float(), 0)
-        if query_scale is not None:
-            payload[query_size + heads :] = torch.where(
-                owned, query_scale.reshape(-1, heads).index_select(0, row).flatten().float(), 0
-            )
-    # Exactly one rank contributes. FP32 preserves BF16/FP16/INT8/FP8 query
-    # values and their scales, and avoids a data-dependent broadcast root.
-    payload = group.all_reduce(payload)
-    shared_query = payload[:query_size].to(query.dtype).view(1, heads, dim)
-    shared_weights = payload[query_size : query_size + heads].view(1, heads)
-    shared_scale = payload[query_size + heads :].view(1, heads) if query_scale is not None else None
-    return shared_query, shared_weights, shared_scale
-
-
 def prepare_pcp_indexer_queries(
-    query: torch.Tensor,
-    weights: torch.Tensor,
-    query_scale: torch.Tensor | None,
-    metadata: PCPIndexerMetadata,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Replicate the selected Q and append it after actual local tokens.
+    query: torch.Tensor, weights: torch.Tensor, query_scale: torch.Tensor, metadata: PCPIndexerMetadata
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange all selected C8 queries in one fixed-size, root-independent collective."""
+    slots = metadata.query_row.numel()
+    tokens = metadata.output_source.numel()
+    heads, dim = query.shape[1:]
+    q_bytes, weight_bytes = heads * dim, 2 * heads
+    scales = query_scale.reshape(-1, heads).to(torch.float16)
+    weights = weights.to(torch.float16)
+    if query.shape[0]:
+        row = metadata.query_row.clamp_min(0)
+        payload = torch.cat(
+            (
+                query.index_select(0, row).reshape(slots, q_bytes),
+                weights.index_select(0, row).contiguous().view(torch.int8),
+                scales.index_select(0, row).contiguous().view(torch.int8),
+            ),
+            dim=1,
+        )
+        payload = torch.where(metadata.query_row[:, None] >= 0, payload, 0)
+    else:
+        payload = query.new_zeros((slots, q_bytes + 2 * weight_bytes))
+    shared = get_pcp_group().all_gather(payload, dim=0).index_select(0, metadata.packet_row)
+    shared_q, shared_w, shared_s = shared.split((q_bytes, weight_bytes, weight_bytes), dim=1)
 
-    The owner retains its original Q row; its appended storage row has zero
-    query length in ``metadata.batch``. Helpers use the appended row. Excluding
-    input padding keeps TND query boundaries valid on partially empty ranks.
-    """
-    assert metadata.batch is not None
-    shared_q, shared_w, shared_s = replicate_indexer_query(
-        query, weights, query_scale, metadata.query_row, get_pcp_group()
+    def assemble(local: torch.Tensor, remote: torch.Tensor) -> torch.Tensor:
+        # The source map uses the padded model extent as the base of the shared rows.
+        if local.shape[0] < tokens:
+            local = torch.cat((local, local.new_zeros((tokens - local.shape[0], *local.shape[1:]))))
+        return torch.cat((local[:tokens], remote)).index_select(0, metadata.query_source)
+
+    return (
+        assemble(query, shared_q.reshape(slots, heads, dim)),
+        assemble(weights, shared_w.contiguous().view(torch.float16)),
+        assemble(scales, shared_s.contiguous().view(torch.float16)),
     )
-    count = metadata.batch.num_local_tokens
-    batched_q = torch.cat((query[:count], shared_q))
-    batched_w = torch.cat((weights[:count], shared_w.to(weights.dtype)))
-    batched_s = None
-    if query_scale is not None:
-        assert shared_s is not None
-        scales = query_scale.reshape(-1, query.shape[1])
-        batched_s = torch.cat((scales[:count], shared_s.to(query_scale.dtype)))
-    return batched_q, batched_w, batched_s
 
 
-def pack_topk_candidates(
-    indices: torch.Tensor, scores: torch.Tensor, key_start: int, seq_len: torch.Tensor
-) -> torch.Tensor:
-    """Pack native candidates with FP32 scores and global int32 token IDs."""
-    indices = indices.flatten().to(torch.int32)
-    valid = (indices >= 0) & (indices < seq_len) & ~torch.isnan(scores) & (scores > -float("inf"))
-    values = scores.masked_fill(~valid, -float("inf"))
-    indices = torch.where(valid, indices + key_start, -1)
-    # Native outputs need not be ordered, especially when K length <= top-k.
-    # Order just the K candidate IDs so the stable merge breaks score ties by ID.
-    indices, order = torch.sort(indices, stable=True)
-    values = values.index_select(0, order).contiguous()
-    return torch.stack((values.view(torch.int32), indices), dim=-1)
+def pack_topk_candidates(indices, scores, key_start, shard_len):
+    """Produce [slot, K, (global ID, FP32 score bits)] in local ID order."""
+    valid = (indices >= 0) & (indices < shard_len[:, None]) & ~torch.isnan(scores) & (scores > -float("inf"))
+    ids = torch.where(valid, indices + key_start[:, None], -1).to(torch.int32)
+    ids, order = torch.sort(ids, dim=-1, stable=True)
+    values = scores.masked_fill(~valid, -float("inf")).gather(1, order).contiguous()
+    return torch.stack((ids, values.view(torch.int32)), dim=-1)
 
 
-def merge_topk_candidates(candidates: torch.Tensor, topk: int) -> torch.Tensor:
-    """Merge rank-major candidates; equal scores prefer the lower global token ID."""
-    scores = candidates[:, 0].contiguous().view(torch.float32)
-    _, order = torch.sort(scores, descending=True, stable=True)
-    return candidates[:, 1].index_select(0, order[:topk]).view(1, 1, topk)
-
-
-def finish_pcp_indexer_topk(
-    topk_indices: torch.Tensor,
-    topk_scores: torch.Tensor,
-    metadata: PCPIndexerMetadata,
-    output_tokens: int,
-) -> torch.Tensor:
-    """Merge A's native candidates and restore the original local output rows.
-
-    Scores come directly from the native selection. No Q/K scoring is done here.
-    """
-    assert metadata.batch is not None
-    batch = metadata.batch
+def finish_pcp_indexer_topk(topk_indices, topk_scores, metadata: PCPIndexerMetadata, output_tokens: int):
+    """Merge independent slots across ranks, then restore only their owners' rows."""
     group = get_pcp_group()
-    indices = topk_indices.index_select(0, batch.shared_row).flatten()
-    scores = topk_scores.index_select(0, batch.shared_row).flatten().float()
-    candidates = pack_topk_candidates(indices, scores, metadata.key_start, batch.shard_seq_len)
-    gathered = group.all_gather(candidates, dim=0)
-    shared_topk = merge_topk_candidates(gathered, topk_indices.shape[-1])
-    local_topk = torch.nn.functional.pad(
-        topk_indices[: batch.num_local_tokens], (0, 0, 0, 0, 0, output_tokens - batch.num_local_tokens), value=-1
-    )
-    selected = torch.arange(output_tokens, device=local_topk.device) == metadata.query_row
-    return torch.where(selected.view(-1, 1, 1), shared_topk.to(local_topk.dtype), local_topk)
+    indices = topk_indices.index_select(0, metadata.shared_row).squeeze(1)
+    scores = topk_scores.index_select(0, metadata.shared_row).squeeze(1).float()
+    slots, k = indices.shape
+    pairs = pack_topk_candidates(indices, scores, metadata.key_start, metadata.shard_seq_len)
+    gathered = group.all_gather(pairs, dim=0).reshape(group.world_size, slots, k, 2)
+    gathered = gathered.transpose(0, 1).reshape(slots, group.world_size * k, 2)
+    # Contiguous shards are rank-ordered in global coordinates, and pack sorted
+    # each shard's IDs. A stable score sort therefore breaks ties by global ID.
+    scores = gathered[:, :, 1].contiguous().view(torch.float32)
+    order = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :k]
+    merged = gathered[:, :, 0].gather(1, order).unsqueeze(1)
+    tokens = metadata.output_source.numel()
+    padding = merged.new_full((1, 1, k), -1)
+    combined = torch.cat((topk_indices[:tokens], merged, padding))
+    return combined.index_select(0, metadata.output_source[:output_tokens])

@@ -111,7 +111,7 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
-from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, PCPIndexerAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
     skip_ring_state_update,
@@ -503,6 +503,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.bind_config(self.vllm_config)
+                if self.ascend_config.use_pcp_indexer_sharding(self.vllm_config):
+                    self.pcp_manager.indexer_min_seq_len = self.ascend_config.pcp_indexer_sharding_min_seq_len
+                    self.pcp_manager.indexer_max_requests = self.ascend_config.pcp_indexer_sharding_max_requests
                 self.pcp_manager.kv_cache_config = kv_cache_config
                 self.pcp_manager.global_input_buffers = self.input_buffers
                 self.model_state.pcp_manager = self.pcp_manager
@@ -1510,7 +1513,12 @@ def graph_manager_wrapper(model_runner):
         varlen_decode: bool = False,
         ubatch_runner: Any = None,  # vLLM main (#51700)
     ):
-        return ModelAclGraphManager(
+        manager_cls = ModelAclGraphManager
+        if cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY and model_runner.ascend_config.use_pcp_indexer_sharding(
+            vllm_config
+        ):
+            manager_cls = PCPIndexerAclGraphManager
+        return manager_cls(
             vllm_config,
             device,
             cudagraph_mode,

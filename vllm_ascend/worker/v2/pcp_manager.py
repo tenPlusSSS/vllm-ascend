@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
+from vllm_ascend.attention.context_parallel.pcp_indexer import PCPIndexerPlan, plan_pcp_indexer_step
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
@@ -59,6 +60,7 @@ class AscendPCPAttentionContext:
     local_to_global_req_indices: tuple[int, ...] | None = None
     # Actual local tokens in the unpartitioned batch, excluding padding.
     local_token_indices: torch.Tensor | None = None
+    indexer_plan: PCPIndexerPlan | None = None
 
 
 class AscendPCPManager(PCPManager):
@@ -71,6 +73,10 @@ class AscendPCPManager(PCPManager):
     _gathered_kv_slot_mappings: torch.Tensor | None
     _pad_slot_id: torch.Tensor
     _sampling_hidden_restored: bool = False
+    indexer_min_seq_len: int | None = None
+    indexer_max_requests: int = 0
+    capture_mixed_indexer: bool = False
+    _indexer_plan: PCPIndexerPlan | None = None
     # The runner's global input buffers, which back global graph metadata.
     global_input_buffers: AscendInputBuffers | None = None
 
@@ -144,6 +150,10 @@ class AscendPCPManager(PCPManager):
     def bind_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self.shard_decode_requests: bool = self.shard_decode_requests and self.is_decode_sharded
+
+    def _indexer_capacity(self, local_tokens: int) -> int:
+        global_capacity = self._get_global_graph_num_reqs(local_tokens, query_len=1)
+        return min(self.indexer_max_requests or global_capacity, global_capacity)
 
     @property
     def is_decode_sharded(self) -> bool:
@@ -315,6 +325,14 @@ class AscendPCPManager(PCPManager):
         local_batch.is_dummy = getattr(global_batch, "is_dummy", False)
         local_batch.is_cpp_profile = getattr(global_batch, "is_cpp_profile", False)
         self._pad_hidden_restore_idx(global_batch)
+        self._indexer_plan = None
+        if self.indexer_min_seq_len is not None and not local_batch.is_dummy:
+            self._indexer_plan = plan_pcp_indexer_step(
+                global_batch,
+                self.indexer_min_seq_len,
+                self._indexer_capacity(local_batch.num_tokens_after_padding),
+                full_graph=padded_num_reqs is not None,
+            )
         if not self.is_decode_sharded:
             local_batch = self._pad_replicated_decode_graph(global_batch, local_batch)
         elif padded_num_reqs is not None:
@@ -683,8 +701,14 @@ class AscendPCPManager(PCPManager):
         # make_dummy refreshes the shared RoPE tables from the global
         # positions, but the model consumes the rank-local ones.
         update_cos_sin(input_batch.positions)
+        # Only the mixed graph's warmup and capture need a cooperative dummy.
+        # Runtime idle DP batches must never inherit the preceding real plan.
+        plan = None
+        if self.capture_mixed_indexer:
+            plan = PCPIndexerPlan((0,), self._indexer_capacity(input_batch.num_tokens_after_padding), True)
         return AscendPCPAttentionContext(
             global_batch=global_batch,
+            indexer_plan=plan,
             global_block_tables=self._block_tables.get_dummy_block_tables(num_reqs),
             global_slot_mappings=self._global_batch_slot_mappings[:, :num_tokens].fill_(-1),
             hidden_restore_idx=torch.arange(num_tokens, device=self.device),
@@ -741,6 +765,7 @@ class AscendPCPManager(PCPManager):
         return AscendPCPAttentionContext(
             global_batch=global_batch,
             local_to_global_req_indices=local_to_global_req_indices,
+            indexer_plan=self._indexer_plan,
             local_token_indices=self._local_gather_idx[: local_batch.num_tokens],
             global_block_tables=self._block_tables.gather_block_tables(
                 global_batch.idx_mapping,

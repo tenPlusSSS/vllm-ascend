@@ -586,7 +586,9 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     enable_pcp_indexer_sharding: bool = False
-    pcp_indexer_sharding_min_seq_len: int = 8192
+    # Inclusive minimum. The default selects visible contexts strictly longer than 128 Ki tokens.
+    pcp_indexer_sharding_min_seq_len: int = 128 * 1024 + 1
+    pcp_indexer_sharding_max_requests: int = 0  # Zero reserves room for every request in the bucket.
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
@@ -665,6 +667,8 @@ class AscendConfig:
     def _validate_user_input_ranges(self):
         if self.pcp_indexer_sharding_min_seq_len < 0:
             raise ValueError("pcp_indexer_sharding_min_seq_len must be non-negative")
+        if self.pcp_indexer_sharding_max_requests < 0:
+            raise ValueError("pcp_indexer_sharding_max_requests must be non-negative")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -691,13 +695,16 @@ class AscendConfig:
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
         if self.enable_pcp_indexer_sharding:
+            from vllm.config.compilation import CUDAGraphMode
+
             if (
                 vc.parallel_config.prefill_context_parallel_size <= 1
                 or vc.parallel_config.decode_context_parallel_size != 1
             ):
                 raise ValueError("enable_pcp_indexer_sharding requires PCP > 1 and DCP = 1")
-            if vc.compilation_config.cudagraph_mode.has_full_cudagraphs():
-                raise ValueError("PCP indexer sharding does not support full graphs; use cudagraph_mode=NONE")
+            mode = vc.compilation_config.cudagraph_mode
+            if mode.has_full_cudagraphs() and mode != CUDAGraphMode.FULL_DECODE_ONLY:
+                raise ValueError("PCP indexer sharding supports full graphs only with FULL_DECODE_ONLY")
             if self.sparse_kv_offload_config.enabled:
                 raise ValueError("PCP indexer sharding does not support sparse KV offload")
         engram_config = getattr(vc, "engram_config", None)
@@ -1220,6 +1227,15 @@ class AscendConfig:
 
         ids = {extract_layer_index(normalized_layer_name)}
         return any(layer_id in layer_ids for layer_id in ids)
+
+    def use_pcp_indexer_sharding(self, vllm_config: VllmConfig) -> bool:
+        return (
+            self.enable_pcp_indexer_sharding
+            and self.enable_sparse_li_c8
+            and vllm_config.attention_config.indexer_kv_dtype == "int8"
+            and vllm_config.speculative_config is None
+            and get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.STANDARD
+        )
 
     def is_sparse_li_c8_layer(self, layer_name: str | None) -> bool:
         return self._is_sparse_li_layer(

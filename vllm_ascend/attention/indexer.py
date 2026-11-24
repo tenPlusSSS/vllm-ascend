@@ -28,7 +28,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     is_pcp_decode_sharding_enabled,
 )
 from vllm_ascend.attention.context_parallel.pcp_indexer import (
-    PCPIndexerMetadata,
+    PCPIndexerInputs,
     build_pcp_indexer_metadata,
     finish_pcp_indexer_topk,
     prepare_pcp_indexer_queries,
@@ -94,7 +94,7 @@ class AscendSFAIndexerMetadata:
     # The selector receives ``(q_li, weights, indexer, metadata, q_li_scale)``;
     # ``q_li_scale`` is set only when LI C8 has already quantized ``q_li``.
     topk_selector: Any | None = None
-    pcp_indexer: PCPIndexerMetadata | None = None
+    pcp_indexer: PCPIndexerInputs | None = None
 
 
 class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
@@ -527,21 +527,21 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         query_lens = indexer_metadata.actual_seq_lengths_query
         key_lens = indexer_metadata.actual_seq_lengths_key
         if pcp_indexer is not None:
-            assert pcp_indexer.batch is not None
-            q_li, weights, q_li_scale = prepare_pcp_indexer_queries(
-                q_li.view(-1, self.n_head, self.head_dim), weights, q_li_scale, pcp_indexer
-            )
             assert q_li_scale is not None
+            layout = pcp_indexer.metadata
+            q_li, weights, q_li_scale = prepare_pcp_indexer_queries(
+                q_li.view(-1, self.n_head, self.head_dim), weights, q_li_scale, layout
+            )
             topk_indices, topk_scores = select_pcp_indexer_candidates(
                 q_li,
                 weights,
                 q_li_scale,
                 self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
                 self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
-                pcp_indexer,
+                layout,
                 self.topk_tokens,
             )
-            return finish_pcp_indexer_topk(topk_indices, topk_scores, pcp_indexer, hidden_states.shape[0])
+            return finish_pcp_indexer_topk(topk_indices, topk_scores, layout, hidden_states.shape[0])
         if indexer_metadata.num_actual_tokens > 0:
             topk_indices = DeviceOperator.indexer_select_post_process(
                 q_li,
@@ -605,7 +605,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 additional_config.get("enable_pcp_indexer_sharding", False), "enable_pcp_indexer_sharding"
             )
         )
-        self.pcp_indexer_min_seq_len = int(additional_config.get("pcp_indexer_sharding_min_seq_len", 8192))
+        self._pcp_indexer_graph_buffers: dict = {}
         self._group_metadata_buffers: dict[
             object,
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1010,7 +1010,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             if cache_group is None:
                 raise RuntimeError("PCP indexer sharding requires the global cache-group index")
             pcp_indexer = build_pcp_indexer_metadata(
-                common_attn_metadata, pcp_context, cache_group, block_size, self.pcp_indexer_min_seq_len
+                common_attn_metadata, pcp_context, cache_group, block_size, self._pcp_indexer_graph_buffers
             )
 
         return AscendSFAIndexerMetadata(

@@ -82,8 +82,9 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_flashcomm1`                 | bool | `False` | Whether to enable SP MoE. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |
 | `enable_pcp_o_proj_weight_sharding` | bool | `True` | Whether PCP shards O-projection weights across the PCP group. This option controls SFA-PCP `o_proj` and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set it to `false` at server startup to disable sharding. Other attention backends do not use this option. |
 | `enable_pcp_embedding_lmhead_weight_sharding` | bool | `True` | Whether PCP shards embedding and LM Head weights across PCP ranks inside each TP shard. This option is enabled by default, takes effect when PCP size is greater than 1, and is incompatible with batch-sharded sampling (`enable_batch_sharded_sampling`) and fine-grained TP for these modules. |
-| `enable_pcp_indexer_sharding` | bool | `False` | Cooperatively score the longest eligible single-token SFA decode request across PCP ranks. Requires PCP > 1, DCP = 1 and no full graph capture or sparse KV offload. See the scope below. |
-| `pcp_indexer_sharding_min_seq_len` | int | `8192` | Minimum visible indexer K length for cooperative scoring. Must be non-negative; `0` allows every eligible decode length. |
+| `enable_pcp_indexer_sharding` | bool | `False` | Cooperatively score eligible single-token SFA decodes across PCP ranks. Supports MRV2 ordinary and mixed decode graph replay with PCP > 1 and DCP = 1. |
+| `pcp_indexer_sharding_min_seq_len` | int | `131073` | Inclusive minimum visible K length in tokens. Zero admits every eligible decode length. |
+| `pcp_indexer_sharding_max_requests` | int | `0` | Maximum selected requests per step and reserved communication slots per mixed graph. Zero uses the bucket's global request capacity. |
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
@@ -391,26 +392,26 @@ PCP gathers prefill KV before cache writes. KVPP layer broadcasts restore prior-
 
 ### PCP indexer sharding
 
-For SFA Lightning Indexer models using PCP decode request sharding with DCP disabled, enable cooperative indexing with:
+On MRV2 with a supported SFA INT8 Lightning Indexer, the following options enable request-selective indexing on replicated PCP caches. Add these to the existing model launch command.
 
 ```bash
---additional-config '{"enable_pcp_indexer_sharding": true, "pcp_indexer_sharding_min_seq_len": 8192}'
+--prefill-context-parallel-size 2 --decode-context-parallel-size 1 \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_pcp_indexer_sharding":true,"pcp_indexer_sharding_min_seq_len":131073,"pcp_indexer_sharding_max_requests":2}'
 ```
 
-Use eager execution (`--enforce-eager`, `cudagraph_mode=NONE`). The feature leaves request ownership and model inputs in the existing PCP layout. Each step selects the scheduled single-token decode request with the largest computed length, breaking ties by global batch order. Requests shorter than the configured visible-K threshold use the ordinary path.
+Each step uses the global scheduled batch. A single-token decode is eligible when its visible K length (previously computed tokens plus the current token) reaches the inclusive minimum. The default of 131073 selects contexts strictly longer than 128 Ki tokens. With a positive request cap, the longest eligible requests win, with ties resolved by global batch order. The example admits two per step. A cap of zero admits every eligible request in the bucket. Prefill chunks and speculative verification use their existing paths.
 
-After the existing indexer K gather and cache write, the owner contributes its projected query, weights and optional C8 query scales to one PCP all-reduce; helper ranks contribute zeros. The selected query shares one native Lightning Indexer call with all ordinary local queries. Its block-table row starts at this rank's assigned logical K block, and its visible K length is restricted to that shard. The owner reuses the original query row; helpers append one query, excluding input padding. Other queries keep their original block tables, lengths and causal boundaries. Each rank keeps K native candidates and exchanges FP32 candidate scores and int32 logical token IDs. A second selection produces the final K indices. Only the owner's original query row is replaced, and only that owner continues the request's sparse attention and subsequent model computation. Empty helper ranks still join both collectives.
+MRV2 captures two full decode graphs per padded model shape. A step with zero selections replays the ordinary graph. The mixed graph handles one or more selections from any owner. Selected rows score contiguous logical K blocks on each PCP rank. Other requests score their full visible K on their owners in the same native QLI call. Owners, request order, block tables and lengths can change between replays. Enable vLLM debug logging to see the graph flavor, local bucket size and selected count. Eager execution also supports request selection and sizes its packets to the actual selected count.
 
-The cooperative path uses the QLI V2 score output imported from [PR #20878](https://github.com/vllm-project/vllm-ascend/pull/20878), commit `6b3b0d031e8cb2158f3c73231068a1da66d0b59b`. Rebuild both the CANN operators (`quant_lightning_indexer_v2` and `quant_lightning_indexer_v2_metadata`) and the vllm-ascend C++ extension after updating; the previously installed binary does not implement this score-output ABI.
+Per cooperative indexer layer the mixed graph exchanges one batch of INT8 Q, FP16 weights and FP16 query scales, then one batch of local top-K candidates (int32 logical token IDs and FP32 scores). Only owners consume the merged rows in sparse attention. Empty helper ranks participate. The graph reserves a fixed number of communication slots per bucket, including unused slots. A small cap can reduce communication and workspace when long requests are rare. To measure the sharding effect, compare the same workload and decode graph settings with the option disabled and enabled. Use a model length above the threshold when benchmarking.
 
-On the A2/A3 standard device adaptor, this path supports INT8 Q/K with FP16 scales, head dimension 128, head counts 32/64, and top-k up to 2048. BF16/FP16, FP8, and FP4 layers keep their original unsharded native selection; they are not requantized. For the tested GLM-5.3 W8A8C8 checkpoint, 16 INT8 indexer layers can cooperate while the 5 BF16 indexer layers retain their original computation. Speculative decoding, replicated draft inputs, dummy batches and batches without eligible decode requests also retain their ordinary selection path. Full graph capture and sparse KV offload are rejected when this option is enabled. KPool and compressed indexers use separate backends and are outside this feature's scope.
+This path uses the score-returning QLI V2 and its metadata producer from [PR #20878](https://github.com/vllm-project/vllm-ascend/pull/20878). Install the branch's CANN operators and C++ extension when upgrading from a baseline without this ABI. Supported layers use INT8 Q/K, FP16 scales, 32 or 64 query heads, head dimension 128 and top-K up to 2048 on the standard Ascend adaptor. Other layer types use their usual indexer. Sparse KV offload is incompatible. Merged cutoff ties follow the candidates admitted by the native kernel, with lower logical positions preferred among communicated ties.
 
-`npu_quant_lightning_indexer_v2` returns indices and FP32 scores together with `return_value=1`. The arch22 comparator uses QK / 1024 internally; every rank preserves this same native scale for the merge. V2 names the existing paged cache layout `PA_BBND` and consumes query boundaries including the leading zero. Operator DCP remains disabled: only the selected request's block table and visible length are partitioned. Its metadata producer runs once per batch/shape and the result is reused by compatible layers. No custom scoring kernel, candidate rescoring, or second indexer call is used. Candidate ties at the merge prefer the lower logical token position, subject to the native local selection's tie-breaking. The historical K cache is not copied, and full score rows are not exchanged. Measure latency and model accuracy on the target NPU before choosing the length threshold; this option does not imply a measured speedup.
-
-Validation commands:
+The multicard test captures both indexer paths once and replays them with changed lengths, owners and physical KV pages. It checks full-context scores on both sides of the default 131073-token cutoff.
 
 ```bash
-pytest tests/ut/attention/test_pcp_indexer.py tests/ut/attention/test_indexer.py
+pytest tests/ut/attention/test_pcp_indexer.py tests/ut/attention/test_indexer.py tests/ut/worker/v2/test_aclgraph.py
 pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_pcp_indexer.py
-torchrun --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 --master-port=29591 --nproc-per-node=2 -m pytest --noconftest tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_pcp_indexer.py
+torchrun --standalone --nproc-per-node=2 -m pytest --noconftest tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_pcp_indexer.py
 ```

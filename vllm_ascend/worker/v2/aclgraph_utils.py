@@ -18,6 +18,8 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -219,7 +221,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         model = ModelWithContext(model, device_metadata=metadata)
         try:
             with communicator_switch():
-                return super().capture(
+                capture = partial(
+                    super().capture,
                     model,
                     model_state,
                     input_buffers,
@@ -231,12 +234,67 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     has_lora=has_lora,
                     use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
                     lora_capture_hook=lora_capture_hook,
-                    progress_bar_desc=progress_bar_desc,
                 )
+                self._capture_variants(capture, pcp_manager, progress_bar_desc)
         finally:
             # Input preparation can fail before ModelWithContext.forward runs.
             if metadata is not None:
                 metadata.finish()
+
+    def _capture_variants(self, capture: Callable, pcp_manager: Any, progress_bar_desc: str) -> None:
+        capture(progress_bar_desc=progress_bar_desc)
+
+
+@dataclass(frozen=True)
+class MixedIndexerDescriptor(BatchExecutionDescriptor):
+    """Same padded model shape, with cooperative QLI collectives in the graph."""
+
+
+class PCPIndexerAclGraphManager(ModelAclGraphManager):
+    """Keep vLLM's shape dispatch and output buffers, with two FULL graphs per bucket."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        full = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        self.mixed_descriptors = {desc: MixedIndexerDescriptor(**vars(desc)) for desc in full}
+        if not full:
+            return
+        # vLLM extrapolates the second sample as a per-graph cost. Let the
+        # largest mixed graph allocate the shared workspace on the first sample.
+        # Only ordinary descriptors remain in upstream shape dispatch.
+        self._capture_descs[CUDAGraphMode.FULL] = [
+            variant for desc in full for variant in (self.mixed_descriptors[desc], desc)
+        ]
+
+    def _capture_variants(self, capture: Callable, pcp_manager: Any, progress_bar_desc: str) -> None:
+        if pcp_manager is None:
+            raise RuntimeError("Capturing cooperative indexer graphs requires the target PCP manager")
+        all_descs = self._capture_descs
+        full = all_descs.get(CUDAGraphMode.FULL, [])[: self._max_full_descs_to_capture]
+        try:
+            for mixed in (True, False):
+                descs = [d for d in full if isinstance(d, MixedIndexerDescriptor) == mixed]
+                if descs:
+                    self._capture_descs = {CUDAGraphMode.FULL: descs}
+                    pcp_manager.capture_mixed_indexer = mixed
+                    variant = "mixed" if mixed else "ordinary"
+                    capture(progress_bar_desc=f"{progress_bar_desc} (PCP indexer {variant})")
+        finally:
+            self._capture_descs = all_descs
+            pcp_manager.capture_mixed_indexer = False
+
+    def run_fullgraph(self, desc: BatchExecutionDescriptor):
+        context = self.model_runner.model_state.pcp_context
+        plan = context.indexer_plan if context is not None else None
+        if plan is not None:
+            desc = self.mixed_descriptors[desc]
+        logger.debug(
+            "PCP indexer replay %s, local bucket %d, selected requests %d",
+            "mixed" if plan is not None else "ordinary",
+            desc.num_tokens,
+            len(plan.requests) if plan else 0,
+        )
+        return super().run_fullgraph(desc)
 
 
 class ModelWithContext(nn.Module):

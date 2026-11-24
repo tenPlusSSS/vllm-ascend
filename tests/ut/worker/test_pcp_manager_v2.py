@@ -1215,6 +1215,30 @@ def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch):
     manager._block_tables.gather_block_tables.assert_not_called()
 
 
+@pytest.mark.parametrize("cap,slots", [(0, 3), (2, 2)])
+def test_mixed_capture_uses_global_slot_capacity_and_idle_decode_has_no_selection(cap, slots):
+    manager = AscendPCPManager(2, 1, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager.global_input_buffers = SimpleNamespace(max_num_reqs=3, max_num_tokens=8)
+    manager._block_tables = MagicMock()
+    manager._global_batch_slot_mappings = torch.full((1, 8), -1)
+    manager.indexer_max_requests = cap
+    dummy = SimpleNamespace(num_reqs_after_padding=2, num_tokens_after_padding=2, positions=torch.arange(2))
+    with (
+        patch.object(AscendInputBatch, "make_dummy", return_value=object()),
+        patch("vllm_ascend.worker.v2.pcp_manager.update_cos_sin"),
+    ):
+        for mixed in (False, True, False):
+            manager.capture_mixed_indexer = mixed
+            context = manager._build_sharded_dummy_attention_context(dummy, 1)
+            plan = context.indexer_plan
+            if mixed:
+                assert plan is not None and plan.full_graph and plan.requests == (0,) and plan.slots == slots
+                manager._indexer_plan = plan
+            else:
+                assert plan is None
+
+
 def test_cpp_dummy_is_partitioned_instead_of_staged():
     manager = AscendPCPManager(2, 0, torch.device("cpu"))
     dummy = _make_global_pcp_batch()

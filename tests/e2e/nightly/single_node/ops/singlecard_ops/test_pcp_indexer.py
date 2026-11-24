@@ -47,7 +47,7 @@ def test_native_fp32_scores_with_mixed_causal_rows_and_padding(heads, length, to
         native_metadata={},
     )
     indices, scores = select_pcp_indexer_candidates(
-        q_cpu.npu(), weights_cpu.npu(), qs_cpu.npu(), cache, scales, SimpleNamespace(batch=batch), topk
+        q_cpu.npu(), weights_cpu.npu(), qs_cpu.npu(), cache, scales, batch, topk
     )
     assert scores.dtype == torch.float32
     assert indices.shape == scores.shape == (4, 1, topk)
