@@ -43,7 +43,6 @@ class PCPIndexerMetadata:
     key_lens: torch.Tensor
     block_table: torch.Tensor
     query_row: torch.Tensor  # Owner's local Q row, or -1 on a helper/unused slot.
-    packet_row: torch.Tensor  # Rank-major row of this slot's Q after all-gather.
     query_source: torch.Tensor  # TND row -> row in [padded local Q | shared Q].
     shared_row: torch.Tensor  # Slot -> native QLI row that produced this rank's candidates.
     key_start: torch.Tensor
@@ -175,7 +174,6 @@ def _build_native_layout(inputs: PCPIndexerInputs) -> PCPIndexerMetadata:
         key_lens=torch.cat((local_lengths, native_len)),
         block_table=torch.cat((local_table, shard_table)),
         query_row=query_row,
-        packet_row=owner_rank * slot_count + slots,
         query_source=query_source,
         shared_row=shared_row,
         key_start=key_start,
@@ -277,7 +275,9 @@ def prepare_pcp_indexer_queries(
         payload = torch.where(metadata.query_row[:, None] >= 0, payload, 0)
     else:
         payload = query.new_zeros((slots, q_bytes + 2 * weight_bytes))
-    shared = get_pcp_group().all_gather(payload, dim=0).index_select(0, metadata.packet_row)
+    # Each active slot has exactly one owner. All other ranks contribute zero bytes,
+    # so INT8 SUM preserves the owner's Q and both FP16 fields bit for bit.
+    shared = get_pcp_group().all_reduce(payload)
     shared_q, shared_w, shared_s = shared.split((q_bytes, weight_bytes, weight_bytes), dim=1)
 
     def assemble(local: torch.Tensor, remote: torch.Tensor) -> torch.Tensor:

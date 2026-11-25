@@ -93,6 +93,9 @@ def test_multiple_requests_exchange_real_rank_payloads_and_restore_outputs(monke
         q = torch.randint(-3, 4, (offsets[-1], heads, dim), generator=generator, dtype=torch.int8)
         w = torch.randint(-3, 4, (offsets[-1], heads), generator=generator).half()
         scale = torch.randint(1, 5, w.shape, generator=generator).half() / 2
+        q[:, 0, :2] = torch.tensor([-128, 127], dtype=torch.int8)
+        w[:, 0] = -0.0
+        scale[:, 0] = 0.333251953125
         rows_by_rank = [[i for i, owner in enumerate(owners) if owner == r] for r in range(world)]
         restore = torch.empty(offsets[-1], dtype=torch.int32)
         for r, reqs in enumerate(rows_by_rank):
@@ -117,7 +120,21 @@ def test_multiple_requests_exchange_real_rank_payloads_and_restore_outputs(monke
                 barrier.wait()
                 return gathered
 
-            rank_local.group = SimpleNamespace(rank_in_group=rank, world_size=world, all_gather=all_gather)
+            def all_reduce(packet):
+                assert packet.dtype == torch.int8
+                assert packet.shape == (slots, heads * (dim + 4))
+                for slot in range(slots):
+                    if slot >= len(selected) or owners[selected[slot]] != rank:
+                        assert (packet[slot] == 0).all()
+                packets[rank] = packet
+                barrier.wait()
+                reduced = torch.stack(packets).sum(dim=0, dtype=torch.int8)
+                barrier.wait()
+                return reduced
+
+            rank_local.group = SimpleNamespace(
+                rank_in_group=rank, world_size=world, all_gather=all_gather, all_reduce=all_reduce
+            )
             reqs = rows_by_rank[rank]
             local_rows = [j for i in reqs for j in range(offsets[i], offsets[i + 1])]
             actual = len(local_rows)
@@ -161,8 +178,8 @@ def test_multiple_requests_exchange_real_rank_payloads_and_restore_outputs(monke
             for s, req in enumerate(selected):
                 native_row = layout.shared_row[s]
                 torch.testing.assert_close(nq[native_row], q[offsets[req]])
-                torch.testing.assert_close(nw[native_row], w[offsets[req]])
-                torch.testing.assert_close(ns[native_row], scale[offsets[req]])
+                torch.testing.assert_close(nw[native_row].view(torch.int16), w[offsets[req]].view(torch.int16))
+                torch.testing.assert_close(ns[native_row].view(torch.int16), scale[offsets[req]].view(torch.int16))
             ids, scores = score_batch(nq, nw, ns, cache, layout, topk)
             result = pcp_indexer.finish_pcp_indexer_topk(ids, scores, layout, local_q.shape[0])
             for row, global_row in enumerate(local_rows):
@@ -204,7 +221,6 @@ def test_traced_layout_reads_new_lengths_owners_and_slot_counts(monkeypatch):
                 batch.key_lens,
                 batch.block_table,
                 batch.query_row,
-                batch.packet_row,
                 batch.query_source,
                 batch.shared_row,
                 batch.key_start,
