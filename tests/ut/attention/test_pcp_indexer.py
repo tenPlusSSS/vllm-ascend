@@ -312,3 +312,72 @@ def test_v2_returns_scores_once_and_reuses_batch_metadata_across_layers(monkeypa
     assert native.call_args.args[1] is cache
     assert native.call_args.args[4].stride(0) == scales.stride(0)
     assert all(t.dtype == torch.float16 for t in native.call_args.args[2:5])
+
+
+def test_unsharded_v2_uses_full_requests_without_collectives(monkeypatch):
+    query = torch.zeros(3, 32, 128, dtype=torch.int8)
+    cache = torch.zeros(8, 128, 1, 128, dtype=torch.int8)[::2]
+    scales = torch.ones(8, 128, 1, 1, dtype=torch.float16)[::2]
+    ends = torch.tensor([1, 2, 3], dtype=torch.int32)
+    lengths = torch.tensor([129, 257, 0], dtype=torch.int32)
+    table = torch.tensor([[3, 1, 0], [2, 1, 0], [0, 0, 0]], dtype=torch.int32)
+    output = torch.zeros(3, 1, 2048, dtype=torch.int32)
+    producer = Mock(side_effect=lambda *args, **kwargs: kwargs["seqused_k"].clone())
+    native = Mock(return_value=(output, torch.empty(0)))
+    group = Mock(side_effect=AssertionError("Unsharded V2 must not access the PCP group"))
+    monkeypatch.setattr(pcp_indexer, "get_pcp_group", group)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", producer, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2", native, raising=False)
+    for updated in ([129, 257, 0], [260, 17, 0]):
+        lengths.copy_(torch.tensor(updated))
+        result = pcp_indexer.select_unsharded_indexer_v2(
+            query, torch.ones(3, 32), torch.ones(3, 32), cache, scales, ends, lengths, table, 2048
+        )
+        assert result is output
+        kwargs = native.call_args.kwargs
+        assert kwargs["return_value"] == 0 and kwargs["enable_dcp"] is False
+        assert kwargs["mask_mode"] == 3 and kwargs["cmp_ratio"] == 1
+        assert kwargs["block_table"] is table and kwargs["seqused_k"] is lengths
+        torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 1, 2, 3], dtype=torch.int32))
+        torch.testing.assert_close(kwargs["metadata"], lengths)
+        assert native.call_args.args[0] is query and native.call_args.args[1] is cache
+        assert native.call_args.args[4].stride(0) == scales.stride(0)
+        assert all(t.dtype == torch.float16 for t in native.call_args.args[2:5])
+    assert producer.call_count == native.call_count == 2
+    group.assert_not_called()
+
+
+def test_unsharded_v2_graph_keeps_metadata_producer_and_reads_updated_lengths(monkeypatch):
+    # CPU tensor implementations stand in for the NPU operators. Their data
+    # dependency verifies that graph capture keeps the metadata producer.
+    def producer(*args, **kwargs):
+        return kwargs["seqused_k"].clone()
+
+    def native(query, key, weights, qs, ks, topk, mode, **kwargs):
+        result = kwargs["metadata"][:, None, None] + kwargs["block_table"][:, :1, None]
+        return result, query.new_empty(0)
+
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", producer, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2", native, raising=False)
+
+    class Scan(torch.nn.Module):
+        def forward(self, query, weights, qs, cache, ks, ends, lengths, table):
+            return pcp_indexer.select_unsharded_indexer_v2(query, weights, qs, cache, ks, ends, lengths, table, 2048)
+
+    args = (
+        torch.zeros(2, 32, 128, dtype=torch.int8),
+        torch.ones(2, 32, dtype=torch.float16),
+        torch.ones(2, 32, dtype=torch.float16),
+        torch.zeros(4, 128, 1, 128, dtype=torch.int8),
+        torch.ones(4, 128, 1, 1, dtype=torch.float16),
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([129, 257], dtype=torch.int32),
+        torch.tensor([[0, 1, 2], [2, 1, 3]], dtype=torch.int32),
+    )
+    model = Scan()
+    model(*args)  # Warmup must not freeze the metadata used by the graph.
+    captured = torch.export.export(model, args).module()
+    args[-2].copy_(torch.tensor([9, 301]))
+    args[-1].copy_(torch.tensor([[3, 1, 0], [0, 2, 1]]))
+    expected = torch.tensor([[[12]], [[301]]], dtype=torch.int32)
+    torch.testing.assert_close(captured(*args), expected)

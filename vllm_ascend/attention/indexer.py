@@ -33,6 +33,7 @@ from vllm_ascend.attention.context_parallel.pcp_indexer import (
     finish_pcp_indexer_topk,
     prepare_pcp_indexer_queries,
     select_pcp_indexer_candidates,
+    select_unsharded_indexer_v2,
     supports_pcp_indexer_sharding,
 )
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
@@ -44,6 +45,7 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
 )
 from vllm_ascend.attention.utils import split_decodes_and_prefills, uses_pcp_sharded_layout
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.logger import init_logger_ascend
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.ops.triton.sfa_indexer_store import store_indexer_key_scale
@@ -57,6 +59,8 @@ from vllm_ascend.utils import (
 # tuple (the scale slot exists only when LI C8 is enabled).
 INDEXER_K_CACHE_SLOT = 0
 INDEXER_SCALE_CACHE_SLOT = 1
+
+logger = init_logger_ascend(__name__)
 
 
 @dataclass
@@ -95,6 +99,7 @@ class AscendSFAIndexerMetadata:
     # ``q_li_scale`` is set only when LI C8 has already quantized ``q_li``.
     topk_selector: Any | None = None
     pcp_indexer: PCPIndexerInputs | None = None
+    use_v2_unsharded: bool = False
 
 
 class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
@@ -127,6 +132,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
     """
 
     accept_output_buffer: bool = True
+    _use_v2_unsharded: bool = False
 
     # Bare annotations only: the buffers themselves are registered per instance
     # in ``__init__`` and stay ``None`` until ``process_weights_after_loading``
@@ -216,6 +222,21 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if self.enable_sparse_li_c4:
             self.c4_k_cache_dtype, self.c4_k_scale_cache_dtype = torch.uint8, torch.float8_e8m0fnu
             self.c4_k_op_dtype = torch_npu.float4_e2m1fn_x2
+
+        if get_ascend_config().enable_indexer_v2_unsharded:
+            if not self.enable_sparse_li_c8:
+                logger.warning_once(
+                    "enable_indexer_v2_unsharded leaves non-C8 indexer layers on their original backend; "
+                    "per-layer precision fallbacks are preserved."
+                )
+            elif not supports_pcp_indexer_sharding(self.c8_k_cache_dtype, self.n_head, self.head_dim, self.topk_tokens):
+                raise ValueError(
+                    f"enable_indexer_v2_unsharded does not support indexer layer {self.k_cache.prefix}: "
+                    f"dtype={self.c8_k_cache_dtype}, heads={self.n_head}, dim={self.head_dim}, topk={self.topk_tokens}"
+                )
+            else:
+                self._use_v2_unsharded = True
+                logger.info_once("Using QLI V2 for unsharded INT8 decode scans (return_value=0).")
 
         model_type = get_current_vllm_config().model_config.hf_config.model_type
         self.is_rope_neox_style = model_type not in ["glm_moe_dsa"]
@@ -543,6 +564,19 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             )
             return finish_pcp_indexer_topk(topk_indices, topk_scores, layout, hidden_states.shape[0])
         if indexer_metadata.num_actual_tokens > 0:
+            if self._use_v2_unsharded and indexer_metadata.use_v2_unsharded:
+                assert q_li_scale is not None
+                return select_unsharded_indexer_v2(
+                    q_li.view(-1, self.n_head, self.head_dim),
+                    weights,
+                    q_li_scale,
+                    self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
+                    self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                    query_lens,
+                    key_lens,
+                    indexer_metadata.block_table,
+                    self.topk_tokens,
+                )
             topk_indices = DeviceOperator.indexer_select_post_process(
                 q_li,
                 q_li_scale,
@@ -598,6 +632,9 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
 
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         additional_config = vllm_config.additional_config or {}
+        self.indexer_v2_unsharded = validate_additional_config_bool(
+            additional_config.get("enable_indexer_v2_unsharded", False), "enable_indexer_v2_unsharded"
+        )
         self.pcp_indexer_sharding = (
             self.use_pcp
             and vllm_config.parallel_config.decode_context_parallel_size == 1
@@ -994,9 +1031,10 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             )
 
         num_decode_tokens = 0
-        if is_pcp_sharded or self.use_dcp:
+        num_prefills = num_reqs
+        if is_pcp_sharded or self.use_dcp or self.indexer_v2_unsharded:
             # PCP's gather and native DCP's fused store need the decode boundary.
-            _, _, num_decode_tokens, _ = split_decodes_and_prefills(
+            _, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 treat_short_extends_as_decodes=(
@@ -1027,4 +1065,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             num_decode_tokens=num_decode_tokens,
             uses_pcp_sharded_layout=is_pcp_sharded,
             pcp_indexer=pcp_indexer,
+            use_v2_unsharded=(
+                self.indexer_v2_unsharded and common_attn_metadata.max_query_len == 1 and num_prefills == 0
+            ),
         )

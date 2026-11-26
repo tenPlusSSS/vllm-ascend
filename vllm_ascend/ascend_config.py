@@ -586,6 +586,7 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     enable_pcp_indexer_sharding: bool = False
+    enable_indexer_v2_unsharded: bool = False
     # Inclusive minimum. The default selects visible contexts strictly longer than 128 Ki tokens.
     pcp_indexer_sharding_min_seq_len: int = 128 * 1024 + 1
     pcp_indexer_sharding_max_requests: int = 0  # Zero reserves room for every request in the bucket.
@@ -906,12 +907,13 @@ class AscendConfig:
         (
             self._sparse_li_c8_layer_ids,
             self._sparse_li_c8_layer_names,
-        ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("INT8_DYNAMIC", "W8A8_MXFP8"))
+        ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("INT8_DYNAMIC", "W8A8_DYNAMIC", "W8A8_MXFP8"))
         (
             self._sparse_li_c4_layer_ids,
             self._sparse_li_c4_layer_names,
         ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("W8A8_MXFP8",))
         self._sparse_li_layer_filter_enabled = self._has_sparse_li_layer_config(quant_config)
+        self._validate_indexer_v2_unsharded(vc)
         # vLLM #60517 removed the torch.compile-based sequence-parallelism pass
         # (and `PassConfig.enable_sp`) in both v0.32.0 and verified main.
 
@@ -1227,6 +1229,25 @@ class AscendConfig:
 
         ids = {extract_layer_index(normalized_layer_name)}
         return any(layer_id in layer_ids for layer_id in ids)
+
+    def _validate_indexer_v2_unsharded(self, vllm_config: VllmConfig) -> None:
+        if not self.enable_indexer_v2_unsharded:
+            return
+        if (
+            not self.enable_sparse_li_c8
+            or vllm_config.attention_config.indexer_kv_dtype != "int8"
+            or get_current_hardware_profile().device_adaptor_family != DeviceAdaptorFamily.STANDARD
+        ):
+            raise ValueError("enable_indexer_v2_unsharded requires an A2/A3 SFA indexer with indexer_kv_dtype=int8")
+        if vllm_config.parallel_config.decode_context_parallel_size != 1 or vllm_config.speculative_config is not None:
+            raise ValueError("enable_indexer_v2_unsharded requires DCP=1 and no speculative decoding")
+        if self.sparse_kv_offload_config.enabled:
+            raise ValueError("enable_indexer_v2_unsharded does not support sparse KV offload")
+        if self._sparse_li_layer_filter_enabled and not self._sparse_li_c8_layer_ids:
+            raise ValueError(
+                "enable_indexer_v2_unsharded found no C8 indexer layers in the model quantization description; "
+                "indexer_kv_dtype=int8 alone does not override per-layer precision fallbacks"
+            )
 
     def use_pcp_indexer_sharding(self, vllm_config: VllmConfig) -> bool:
         return (

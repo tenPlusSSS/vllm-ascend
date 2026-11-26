@@ -252,6 +252,65 @@ def select_pcp_indexer_candidates(
     )
 
 
+def select_unsharded_indexer_v2(
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    query_scale: torch.Tensor,
+    key_cache: torch.Tensor,
+    key_scale: torch.Tensor,
+    query_ends: torch.Tensor,
+    key_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Scan full owner-local requests with QLI V2, returning indices only.
+
+    Build metadata on every forward so its producer is captured along with
+    the scan, including after graph warmup. Replay then consumes current
+    device lengths instead of a metadata tensor frozen during warmup.
+    No PCP query exchange, partitioning or candidate collective is needed.
+    """
+    heads, dim = query.shape[1:]
+    quant_mode = 2  # QLI V2 INT8 mode, matching the cooperative path.
+    query_start_loc = torch.cat((query_ends.new_zeros(1), query_ends))
+    metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+        heads,
+        1,
+        dim,
+        topk,
+        quant_mode,
+        cu_seqlens_q=query_start_loc,
+        seqused_k=key_lens,
+        batch_size=key_lens.shape[0],
+        max_seqlen_q=-1,
+        max_seqlen_k=-1,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=3,
+        cmp_ratio=1,
+    )
+    indices, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+        query.contiguous(),
+        key_cache,
+        weights.to(torch.float16).contiguous(),
+        query_scale.reshape(query.shape[:-1]).to(torch.float16).contiguous(),
+        key_scale.reshape(key_cache.shape[:2] + (1,)),
+        topk,
+        quant_mode,
+        cu_seqlens_q=query_start_loc,
+        seqused_k=key_lens,
+        block_table=block_table,
+        metadata=metadata,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=3,
+        cmp_ratio=1,
+        return_value=0,
+        enable_dcp=False,
+    )
+    return indices
+
+
 def prepare_pcp_indexer_queries(
     query: torch.Tensor, weights: torch.Tensor, query_scale: torch.Tensor, metadata: PCPIndexerMetadata
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

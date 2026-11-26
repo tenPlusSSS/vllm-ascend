@@ -83,6 +83,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_pcp_o_proj_weight_sharding` | bool | `True` | Whether PCP shards O-projection weights across the PCP group. This option controls SFA-PCP `o_proj` and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set it to `false` at server startup to disable sharding. Other attention backends do not use this option. |
 | `enable_pcp_embedding_lmhead_weight_sharding` | bool | `True` | Whether PCP shards embedding and LM Head weights across PCP ranks inside each TP shard. This option is enabled by default, takes effect when PCP size is greater than 1, and is incompatible with batch-sharded sampling (`enable_batch_sharded_sampling`) and fine-grained TP for these modules. |
 | `enable_pcp_indexer_sharding` | bool | `False` | Cooperatively score eligible single-token SFA decodes across PCP ranks. Supports MRV2 ordinary and mixed decode graph replay with PCP > 1 and DCP = 1. |
+| `enable_indexer_v2_unsharded` | bool | `False` | Use QLI V2 for full-KV scans of supported INT8 SFA indexer layers in single-token decode batches. Independent of PCP indexer sharding; returns indices only and adds no indexer collectives. See the comparison below. |
 | `pcp_indexer_sharding_min_seq_len` | int | `131073` | Inclusive minimum visible K length in tokens. Zero admits every eligible decode length. |
 | `pcp_indexer_sharding_max_requests` | int | `0` | Maximum selected requests per step and reserved communication slots per mixed graph. Zero uses the bucket's global request capacity. |
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
@@ -389,6 +390,54 @@ KVPP supports non-hybrid MLA/SFA models with eager execution or `PIECEWISE` grap
 KVPP can be combined with `MooncakeConnectorV2` for P/D disaggregation and `AscendStoreConnector` for KV pooling under the connector-specific restrictions in the [KVPP guide](../feature_guide/kvpp.md#kv-transfer-configuration). Enable KVPP only on the prefill node for P/D disaggregation. `MultiConnector` can combine these connectors; each child must satisfy its own type and role requirements.
 
 PCP gathers prefill KV before cache writes. KVPP layer broadcasts restore prior-forward cache contents before attention; the broadcast decision uses the global scheduled batch rather than PCP-local segment offsets.
+
+### Ordinary indexer scans with QLI V2
+
+Set `enable_indexer_v2_unsharded` to compare the original quantized Lightning
+Indexer with QLI V2 without splitting requests. This option requires an A2/A3
+SFA indexer, `indexer_kv_dtype=int8`, DCP=1, and no speculative decoding or
+sparse KV offload. It works with or without PCP and does not require
+`enable_pcp_indexer_sharding`.
+
+Merge these entries into the existing `--additional-config` JSON:
+
+```json
+{
+  "enable_indexer_v2_unsharded": true,
+  "enable_pcp_indexer_sharding": false
+}
+```
+
+The ordinary V2 path scans each owner's complete visible KV using the existing
+block table and lengths. It uses `return_value=0` and introduces no query
+exchange, candidate exchange, or merge. Existing model and cache-write
+communications still run. Prefill and batches containing prefill keep their
+original path. Per-layer BF16 fallbacks are preserved with a startup warning;
+a quantization description that excludes every C8 indexer layer is rejected.
+Supported C8 layers require 32 or 64 query heads, head dimension 128, and
+top-k at most 2048.
+
+C8 layer filtering recognizes `INT8_DYNAMIC`, `W8A8_DYNAMIC`, and `W8A8_MXFP8`
+in the checkpoint's per-layer `.indexer.quant_type` or `.indexer.wq_b.weight`
+entries. This also enables those layers to use PCP indexer sharding when its
+other conditions are met. The model's overall weight quantization label alone
+does not enable C8; keep `indexer_kv_dtype=int8` for these V2 experiments.
+
+| Comparison | `enable_indexer_v2_unsharded` | `enable_pcp_indexer_sharding` | Decode scan |
+| --- | --- | --- | --- |
+| Original OFF | `false` | `false` | Original QLI, full KV |
+| V2 OFF | `true` | `false` | QLI V2, full KV, `return_value=0` |
+| V2 ON | `true` | `true` | Ordinary steps use V2 full scans; eligible steps use V2 sharded scans with scores and merging |
+
+Use the same INT8 checkpoint configuration, graph mode, and inputs across all
+three runs. V2 OFF versus original OFF measures the backend change; V2 ON
+versus V2 OFF measures the net sharding effect, including its required score
+output and communication. V2 ON must also beat original OFF to demonstrate an
+improvement over the original serving baseline.
+
+Restart the service after changing this option. Under `FULL_DECODE_ONLY`, the
+V2 metadata producer is captured with the scan and consumes the refreshed
+device sequence lengths on replay. The flag does not select graphs at runtime.
 
 ### PCP indexer sharding
 

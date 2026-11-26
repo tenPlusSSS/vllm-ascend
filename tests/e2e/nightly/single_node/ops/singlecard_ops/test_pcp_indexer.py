@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_ascend.attention.context_parallel.pcp_indexer import select_pcp_indexer_candidates
+from vllm_ascend.attention.context_parallel.pcp_indexer import (
+    select_pcp_indexer_candidates,
+    select_unsharded_indexer_v2,
+)
 
 torch_npu = pytest.importorskip("torch_npu")
 
@@ -67,3 +70,46 @@ def test_native_fp32_scores_with_mixed_causal_rows_and_padding(heads, length, to
         torch.testing.assert_close(values[valid], reference[ids[valid]], rtol=0, atol=0)
         cutoff = reference.topk(min(visible, topk)).values[-1]
         assert (values[valid] >= cutoff).all()
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@torch.inference_mode()
+def test_unsharded_v2_graph_replay_with_changed_lengths_and_pages(heads):
+    """Run on A2/A3 with the QLI V2 extension installed.
+
+    Warm up at length one, then replay with longer requests and different
+    physical pages. This catches metadata accidentally frozen at capture.
+    """
+    torch.manual_seed(27)
+    query = torch.randint(-3, 4, (3, heads, 128), dtype=torch.int8, device="npu")
+    weights = torch.ones(3, heads, dtype=torch.float16, device="npu")
+    qscale = torch.ones_like(weights)
+    cache = torch.randint(-4, 5, (6, 128, 1, 128), dtype=torch.int8, device="npu")
+    kscale = torch.ones(6, 128, 1, 1, dtype=torch.float16, device="npu")
+    ends = torch.tensor([1, 2, 3], dtype=torch.int32, device="npu")
+    lengths = torch.tensor([1, 1, 0], dtype=torch.int32, device="npu")
+    table = torch.tensor([[0, 1, 2], [3, 4, 5], [0, 0, 0]], dtype=torch.int32, device="npu")
+    topk = 32
+
+    def run():
+        return select_unsharded_indexer_v2(query, weights, qscale, cache, kscale, ends, lengths, table, topk)
+
+    for _ in range(3):
+        run()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = run()
+    for visible in ([129, 257, 0], [260, 33, 0], [4, 9, 0]):
+        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="npu"))
+        table.copy_(table.flip(1))
+        graph.replay()
+        torch.npu.synchronize()
+        replayed = output.cpu()
+        torch.testing.assert_close(replayed, run().cpu(), rtol=0, atol=0)
+        for row, length in enumerate(visible):
+            ids = replayed[row, 0]
+            valid = ids >= 0
+            assert valid.sum() == min(length, topk)
+            assert ids[valid].unique().numel() == valid.sum()
+            assert (ids[valid] < length).all()
