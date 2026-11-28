@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Replay both decode indexers with new request owners and paged KV inputs on PCP2/4."""
+"""Replay both decode indexers with new request owners and paged KV inputs on PCP2/4/8."""
 
 import os
 from types import SimpleNamespace
@@ -20,12 +20,15 @@ from vllm_ascend.utils import enable_custom_op
 
 torch_npu = pytest.importorskip("torch_npu")
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
-pytestmark = pytest.mark.skipif(WORLD_SIZE not in (2, 4), reason="requires PCP2 or PCP4")
+pytestmark = pytest.mark.skipif(WORLD_SIZE not in (2, 4, 8), reason="requires PCP2/4/8")
 
 
-@pytest.mark.parametrize("topk,minimum", [(32, 129), (2048, 131073)])
+@pytest.mark.parametrize(
+    "topk,minimum,backend",
+    [(32, 129, "torch"), (2048, 131073, "torch"), (2048, 131073, "triton_pack"), (2048, 131073, "triton_merge")],
+)
 @torch.inference_mode()
-def test_threshold_changes_and_owner_switch_in_the_same_captured_bucket(monkeypatch, topk, minimum):
+def test_threshold_changes_and_owner_switch_in_the_same_captured_bucket(monkeypatch, topk, minimum, backend):
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     assert enable_custom_op()
@@ -129,7 +132,7 @@ def test_threshold_changes_and_owner_switch_in_the_same_captured_bucket(monkeypa
             ids, scores = pcp_indexer.select_pcp_indexer_candidates(
                 packed_q, packed_w, packed_s, cache, kscale, metadata, topk
             )
-            return pcp_indexer.finish_pcp_indexer_topk(ids, scores, metadata, tokens)
+            return pcp_indexer.finish_pcp_indexer_topk(ids, scores, metadata, tokens, backend)
 
         graphs = {}
         for mixed in (False, True):

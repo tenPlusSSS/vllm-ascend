@@ -21,6 +21,7 @@ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 def test_unsharded_v2_initialization_preserves_layer_precision(monkeypatch, enabled, c8, expected):
     config = SimpleNamespace(
         enable_indexer_v2_unsharded=enabled,
+        pcp_indexer_merge_backend="triton_merge",
         is_sparse_li_c8_layer=lambda prefix: c8,
         is_sparse_li_c4_layer=lambda prefix: False,
     )
@@ -48,6 +49,7 @@ def test_unsharded_v2_initialization_preserves_layer_precision(monkeypatch, enab
     backend = AscendSFAIndexerBackend(indexer, qk_rope_head_dim=64)
     assert backend._use_v2_unsharded is expected
     assert backend.enable_sparse_li_c8 is c8
+    assert backend.pcp_indexer_merge_backend == "triton_merge"
 
 
 @pytest.mark.parametrize(
@@ -116,6 +118,7 @@ def test_unsharded_v2_forward_routing(monkeypatch, enabled, decode, cooperative,
     backend = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
     torch.nn.Module.__init__(backend)
     backend._use_v2_unsharded = enabled
+    backend.pcp_indexer_merge_backend = "triton_pack"
     backend._use_fused_cache_store = False
     backend.enable_sparse_li_c8, backend.enable_sparse_li_c4 = True, False
     backend.c8_k_cache_dtype = torch.int8
@@ -163,6 +166,8 @@ def test_unsharded_v2_forward_routing(monkeypatch, enabled, decode, cooperative,
     assert legacy.call_count == int(expected == "legacy")
     assert v2.call_count == int(expected == "v2")
     assert prepare.call_count == select.call_count == finish.call_count == int(expected == "mixed")
+    if expected == "mixed":
+        assert finish.call_args.args[-1] == "triton_pack"
     if expected == "v2":
         assert v2.call_args.args[6] is metadata.actual_seq_lengths_key
         assert v2.call_args.args[7] is metadata.block_table

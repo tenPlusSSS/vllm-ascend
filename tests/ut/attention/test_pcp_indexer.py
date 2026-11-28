@@ -252,6 +252,28 @@ def test_traced_layout_reads_new_lengths_owners_and_slot_counts(monkeypatch):
         torch.testing.assert_close(traced(*args), layout(*args))
 
 
+@pytest.mark.parametrize("backend", ["triton_pack", "triton_merge"])
+def test_small_k_uses_torch_for_experimental_backends(monkeypatch, backend):
+    def gather(pairs, dim):
+        peer = pairs.clone()
+        peer[..., 0] += 2
+        return torch.cat((pairs, peer), dim=dim)
+
+    group = SimpleNamespace(world_size=2, all_gather=Mock(side_effect=gather))
+    monkeypatch.setattr(pcp_indexer, "get_pcp_group", lambda: group)
+    metadata = SimpleNamespace(
+        shared_row=torch.tensor([0]),
+        key_start=torch.tensor([4]),
+        shard_seq_len=torch.tensor([2]),
+        output_source=torch.tensor([1]),
+    )
+    ids = torch.tensor([[[1, 0]]], dtype=torch.int32)
+    scores = torch.tensor([[[3.0, 1.0]]])
+    result = pcp_indexer.finish_pcp_indexer_topk(ids, scores, metadata, 1, backend)
+    assert torch.equal(result, torch.tensor([[[5, 7]]], dtype=torch.int32))
+    group.all_gather.assert_called_once()
+
+
 def test_candidate_packet_preserves_large_ids_and_invalid_scores():
     start = 2**24 + 1
     pairs = pcp_indexer.pack_topk_candidates(

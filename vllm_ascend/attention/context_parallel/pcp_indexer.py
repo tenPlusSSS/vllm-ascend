@@ -361,21 +361,45 @@ def pack_topk_candidates(indices, scores, key_start, shard_len):
     return torch.stack((ids, values.view(torch.int32)), dim=-1)
 
 
-def finish_pcp_indexer_topk(topk_indices, topk_scores, metadata: PCPIndexerMetadata, output_tokens: int):
+def finish_pcp_indexer_topk(
+    topk_indices, topk_scores, metadata: PCPIndexerMetadata, output_tokens: int, backend: str = "torch"
+):
     """Merge independent slots across ranks, then restore only their owners' rows."""
     group = get_pcp_group()
-    indices = topk_indices.index_select(0, metadata.shared_row).squeeze(1)
-    scores = topk_scores.index_select(0, metadata.shared_row).squeeze(1).float()
-    slots, k = indices.shape
-    pairs = pack_topk_candidates(indices, scores, metadata.key_start, metadata.shard_seq_len)
-    gathered = group.all_gather(pairs, dim=0).reshape(group.world_size, slots, k, 2)
-    gathered = gathered.transpose(0, 1).reshape(slots, group.world_size * k, 2)
-    # Contiguous shards are rank-ordered in global coordinates, and pack sorted
-    # each shard's IDs. A stable score sort therefore breaks ties by global ID.
+    slots, k = metadata.shared_row.numel(), topk_indices.shape[-1]
+    use_triton = backend != "torch" and k == 2048
+    if use_triton:
+        # Keep the default backend usable on installations without Triton.
+        from vllm_ascend.ops.triton.pcp_indexer_candidates import pack_sorted_candidates
+
+        pairs = pack_sorted_candidates(
+            topk_indices, topk_scores, metadata.shared_row, metadata.key_start, metadata.shard_seq_len
+        )
+    else:
+        indices = topk_indices.index_select(0, metadata.shared_row).squeeze(1)
+        scores = topk_scores.index_select(0, metadata.shared_row).squeeze(1).float()
+        pairs = pack_topk_candidates(indices, scores, metadata.key_start, metadata.shard_seq_len)
+    gathered = group.all_gather(pairs, dim=0)
+    if use_triton and backend == "triton_merge":
+        from vllm_ascend.ops.triton.pcp_indexer_candidates import merge_sorted_candidates
+
+        return merge_sorted_candidates(
+            gathered, topk_indices, metadata.output_source, output_tokens, slots, group.world_size
+        )
+    return merge_candidates_torch(
+        gathered, topk_indices, metadata.output_source, output_tokens, slots, group.world_size
+    )
+
+
+def merge_candidates_torch(gathered, topk_indices, output_source, output_tokens, slots, world):
+    k = topk_indices.shape[-1]
+    gathered = gathered.reshape(world, slots, k, 2).transpose(0, 1).reshape(slots, world * k, 2)
+    # Both packers put equal-score candidates in ascending ID order within
+    # each shard. Contiguous shards arrive in rank order.
     scores = gathered[:, :, 1].contiguous().view(torch.float32)
     order = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :k]
     merged = gathered[:, :, 0].gather(1, order).unsqueeze(1)
-    tokens = metadata.output_source.numel()
+    tokens = output_source.numel()
     padding = merged.new_full((1, 1, k), -1)
     combined = torch.cat((topk_indices[:tokens], merged, padding))
-    return combined.index_select(0, metadata.output_source[:output_tokens])
+    return combined.index_select(0, output_source[:output_tokens])

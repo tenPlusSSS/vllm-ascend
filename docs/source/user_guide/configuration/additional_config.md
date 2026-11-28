@@ -86,6 +86,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_indexer_v2_unsharded` | bool | `False` | Use QLI V2 for full-KV scans of supported INT8 SFA indexer layers in single-token decode batches. Independent of PCP indexer sharding; returns indices only and adds no indexer collectives. See the comparison below. |
 | `pcp_indexer_sharding_min_seq_len` | int | `131073` | Inclusive minimum visible K length in tokens. Zero admits every eligible decode length. |
 | `pcp_indexer_sharding_max_requests` | int | `0` | Maximum selected requests per step and reserved communication slots per mixed graph. Zero uses the bucket's global request capacity. |
+| `pcp_indexer_merge_backend` | str | `"torch"` | Mixed PCP indexer candidate backend: `torch` (A), `triton_pack` (B), or `triton_merge` (C). The experimental Triton paths specialize to K=2048. |
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
@@ -440,6 +441,17 @@ V2 metadata producer is captured with the scan and consumes the refreshed
 device sequence lengths on replay. The flag does not select graphs at runtime.
 
 ### PCP indexer sharding
+
+Set `pcp_indexer_merge_backend` in `--additional-config` before graph capture. With K=2048,
+`triton_pack` combines native row selection, masking, score/ID ordering and packing
+in one kernel, including for one slot. `triton_merge` uses the same packets and also merges
+sorted lists in groups of up to four before writing global winners to selected output rows.
+Both require Triton Ascend. Other K values use the torch path. Each mode uses the same PCP
+collectives. For a single-NPU stage comparison on the installed branch run
+`python benchmarks/bench_merge_graph.py --pcp-triton --world-size 8 --slots 1 --unroll 1`.
+Add `--trace-dir ./pcp-traces` to record separate NPU traces after timing. For PCP8,
+the fused cases launch `_pack_kernel`, then after AllGather use `_merge_groups` and
+`_merge_to_output` in backend C. Restart serving when changing the capture-time backend.
 
 On MRV2 with a supported SFA INT8 Lightning Indexer, the following options enable request-selective indexing on replicated PCP caches. Add these to the existing model launch command.
 

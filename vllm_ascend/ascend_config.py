@@ -586,6 +586,7 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     enable_pcp_indexer_sharding: bool = False
+    pcp_indexer_merge_backend: Literal["torch", "triton_pack", "triton_merge"] = "torch"
     enable_indexer_v2_unsharded: bool = False
     # Inclusive minimum. The default selects visible contexts strictly longer than 128 Ki tokens.
     pcp_indexer_sharding_min_seq_len: int = 128 * 1024 + 1

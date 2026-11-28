@@ -207,7 +207,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         self.qk_rope_head_dim = qk_rope_head_dim
         vllm_indexer.topk_indices_buffer = None  # delete topk_indices_buffer
 
-        self.enable_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(self.k_cache.prefix)
+        ascend_config = get_ascend_config()
+        self.enable_sparse_li_c8 = ascend_config.is_sparse_li_c8_layer(self.k_cache.prefix)
+        self.pcp_indexer_merge_backend = ascend_config.pcp_indexer_merge_backend
         if self.enable_sparse_li_c8:
             self.c8_k_cache_dtype = kv_cache_dtype_str_to_dtype(
                 get_current_vllm_config().attention_config.indexer_kv_dtype,
@@ -562,7 +564,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
                 layout,
                 self.topk_tokens,
             )
-            return finish_pcp_indexer_topk(topk_indices, topk_scores, layout, hidden_states.shape[0])
+            return finish_pcp_indexer_topk(
+                topk_indices, topk_scores, layout, hidden_states.shape[0], self.pcp_indexer_merge_backend
+            )
         if indexer_metadata.num_actual_tokens > 0:
             if self._use_v2_unsharded and indexer_metadata.use_v2_unsharded:
                 assert q_li_scale is not None

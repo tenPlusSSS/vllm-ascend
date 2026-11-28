@@ -134,6 +134,7 @@ def test_pcp_indexer_forward_updates_only_owner_after_cache_write(monkeypatch, l
     torch.nn.Module.__init__(indexer)
     indexer._use_fused_cache_store = False
     indexer.enable_sparse_li_c8 = cooperative
+    indexer.pcp_indexer_merge_backend = "torch"
     indexer.enable_sparse_li_c4 = False
     indexer.c8_k_cache_dtype = torch.int8
     indexer._quantize_li_tensor = lambda q: (q.to(torch.int8), torch.ones(q.shape[:-1], dtype=torch.float16))
@@ -179,7 +180,8 @@ def test_pcp_indexer_forward_updates_only_owner_after_cache_write(monkeypatch, l
             torch.cat((scale[:actual_tokens], scale[:1])),
         )
 
-    def finish(indices, scores, metadata, output_tokens):
+    def finish(indices, scores, metadata, output_tokens, backend):
+        assert backend == "torch"
         events.append("merge")
         assert indices is native_output
         assert scores is native_scores
